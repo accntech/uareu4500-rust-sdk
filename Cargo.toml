@@ -1,9 +1,9 @@
 [package]
-name = "uareu4500"
+name = "uareu"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "UareU 4500 Rust SDK: experimental Linux and macOS USB fingerprint capture"
+description = "UareU Rust SDK: experimental Windows, Linux and macOS USB fingerprint capture"
 license = "GPL-3.0-or-later"
 
 [dependencies]
@@ -21,7 +21,7 @@ sha2 = "0.10"
 path = "src/lib.rs"
 
 [[bin]]
-name = "uareu4500"
+name = "uareu"
 path = "src/main.rs"
 
 [workspace]

@@ -3,7 +3,7 @@ use std::process::Command;
 
 #[test]
 fn help_exposes_device_listing_and_capture() {
-    let output = Command::new(env!("CARGO_BIN_EXE_uareu4500"))
+    let output = Command::new(env!("CARGO_BIN_EXE_uareu"))
         .arg("--help")
         .output()
         .unwrap();
@@ -15,7 +15,7 @@ fn help_exposes_device_listing_and_capture() {
 
 #[test]
 fn capture_rejects_zero_timeout_before_accessing_usb() {
-    let output = Command::new(env!("CARGO_BIN_EXE_uareu4500"))
+    let output = Command::new(env!("CARGO_BIN_EXE_uareu"))
         .args(["capture", "--output", "unused.png", "--timeout", "0"])
         .output()
         .unwrap();
@@ -25,7 +25,7 @@ fn capture_rejects_zero_timeout_before_accessing_usb() {
 
 #[test]
 fn capture_requires_an_explicit_output_file() {
-    let output = Command::new(env!("CARGO_BIN_EXE_uareu4500"))
+    let output = Command::new(env!("CARGO_BIN_EXE_uareu"))
         .arg("capture")
         .output()
         .unwrap();
@@ -35,7 +35,7 @@ fn capture_requires_an_explicit_output_file() {
 
 #[test]
 fn license_command_shows_gpl_grant_attribution_and_warranty_terms() {
-    let output = Command::new(env!("CARGO_BIN_EXE_uareu4500"))
+    let output = Command::new(env!("CARGO_BIN_EXE_uareu"))
         .arg("license")
         .output()
         .unwrap();
@@ -50,7 +50,7 @@ fn license_command_shows_gpl_grant_attribution_and_warranty_terms() {
 
 #[test]
 fn capture_help_documents_continuous_mode_and_directory() {
-    let output = Command::new(env!("CARGO_BIN_EXE_uareu4500"))
+    let output = Command::new(env!("CARGO_BIN_EXE_uareu"))
         .args(["capture", "--help"])
         .output()
         .unwrap();
@@ -62,7 +62,7 @@ fn capture_help_documents_continuous_mode_and_directory() {
 
 #[test]
 fn continuous_mode_rejects_single_output_before_usb_access() {
-    let output = Command::new(env!("CARGO_BIN_EXE_uareu4500"))
+    let output = Command::new(env!("CARGO_BIN_EXE_uareu"))
         .args(["capture", "--continuous", "--output", "unused.png"])
         .output()
         .unwrap();
@@ -73,7 +73,7 @@ fn continuous_mode_rejects_single_output_before_usb_access() {
 
 #[test]
 fn output_directory_requires_continuous_mode_before_usb_access() {
-    let output = Command::new(env!("CARGO_BIN_EXE_uareu4500"))
+    let output = Command::new(env!("CARGO_BIN_EXE_uareu"))
         .args([
             "capture",
             "--output",

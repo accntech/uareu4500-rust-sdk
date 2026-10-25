@@ -6,7 +6,9 @@ use std::{fs::File, io::BufReader, path::Path};
 
 use crate::frame::Image;
 
-pub(crate) const PNG_METADATA_KEY: &str = "uareu4500.metadata.v1";
+pub(crate) const PNG_METADATA_KEY: &str = "uareu.metadata.v1";
+// Read existing captures without dropping their resolution/processing provenance.
+const LEGACY_PNG_METADATA_KEY: &str = "uareu4500.metadata.v1";
 const MAX_PIXELS: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -188,7 +190,9 @@ impl CapturedImage {
             .info()
             .utf8_text
             .iter()
-            .filter(|entry| entry.keyword == PNG_METADATA_KEY)
+            .filter(|entry| {
+                entry.keyword == PNG_METADATA_KEY || entry.keyword == LEGACY_PNG_METADATA_KEY
+            })
             .cloned()
             .collect();
         ensure!(embedded.len() <= 1, "duplicate image metadata");

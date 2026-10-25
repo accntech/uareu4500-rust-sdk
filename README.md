@@ -1,4 +1,7 @@
-# UareU 4500 Rust SDK
+# UareU Rust SDK
+
+The crate/import name and CLI are now `uareu`. Update application imports and
+build commands when migrating; Rust capture function signatures are unchanged.
 
 Experimental Rust library and command-line tool for U.are.U 4500 USB image
 capture on Windows, Linux, and macOS. Licensed **GPL-3.0-or-later**; see [LICENSE](LICENSE)
@@ -18,15 +21,15 @@ Microsoft's built-in WinUSB driver; see [Windows USB setup](#windows-usb-setup).
 
 ```sh
 cargo build --locked --release
-./target/release/uareu4500 list
-./target/release/uareu4500 capture --output fingerprint.png --timeout 30
-./target/release/uareu4500 license
+./target/release/uareu list
+./target/release/uareu capture --output fingerprint.png --timeout 30
+./target/release/uareu license
 ```
 
 To keep scanning without restarting the app:
 
 ```sh
-./target/release/uareu4500 capture --continuous --output-dir captures
+./target/release/uareu capture --continuous --output-dir captures
 ```
 
 Place your finger to capture, lift it when prompted, then place it again for the
@@ -70,8 +73,8 @@ communicate with the reader; fingerprint capture remains in the Rust application
 
    ```powershell
    cargo build --locked --release
-   .\target\release\uareu4500.exe list
-   .\target\release\uareu4500.exe capture --continuous --output-dir captures
+   .\target\release\uareu.exe list
+   .\target\release\uareu.exe capture --continuous --output-dir captures
    ```
 
 Place a finger when prompted, then lift and replace it between captures. Press
@@ -93,7 +96,7 @@ and [Code 28 explanation](https://learn.microsoft.com/en-us/windows-hardware/dri
 On Linux, install the reader-scoped active-session rule, then reconnect:
 
 ```sh
-sudo install -m 0644 udev/70-uareu4500.rules /etc/udev/rules.d/70-uareu4500.rules
+sudo install -m 0644 udev/70-uareu.rules /etc/udev/rules.d/70-uareu.rules
 sudo udevadm control --reload-rules
 ```
 
@@ -109,16 +112,18 @@ datasheet resolution does not establish the effective PPI of this decoder's
 output. Neither capture nor quality inspection assumes 500 or 512 PPI.
 
 The CLI now saves processing and descriptor-coverage metadata in PNG iTXt under
-`uareu4500.metadata.v1`. Known resolution is also written to the PNG `pHYs` chunk
+`uareu.metadata.v1`. Known resolution is also written to the PNG `pHYs` chunk
 as pixels per metre, rounded to the nearest integer. Unknown resolution omits
 `pHYs`. Metadata records its source, not a claim of independently verified
 hardware calibration. Metadata edited outside this application remains an
 untrusted declaration; imports reject conflicting metadata and `pHYs` values.
+The previous `uareu4500.metadata.v1` key remains readable for existing captures;
+files containing both old and new metadata keys are rejected as ambiguous.
 
 Inspect a previously captured image without opening USB hardware:
 
 ```powershell
-.\target\release\uareu4500.exe quality --input fingerprint.png
+.\target\release\uareu.exe quality --input fingerprint.png
 ```
 
 The JSON report contains resolution provenance, known processing, and image
@@ -141,7 +146,7 @@ separately. No quality engine is downloaded, bundled, or required for capture.
 For an image already established as 500 PPI on both axes:
 
 ```powershell
-.\target\release\uareu4500.exe quality --input known-500ppi.png --nfiq2 C:\NFIQ2\bin\nfiq2.exe
+.\target\release\uareu.exe quality --input known-500ppi.png --nfiq2 C:\NFIQ2\bin\nfiq2.exe
 ```
 
 Embedded-model builds identify the model through the executable SHA-256. For a
@@ -200,7 +205,7 @@ establish recognition accuracy or the resolution of physical-reader captures.
 
 ```rust,no_run
 use std::{sync::atomic::AtomicBool, time::Duration};
-use uareu4500::{protocol::CaptureOptions, usb::{readers, Reader}};
+use uareu::{protocol::CaptureOptions, usb::{readers, Reader}};
 
 fn main() -> anyhow::Result<()> {
     let devices = readers()?;
@@ -238,7 +243,7 @@ No resolution is inferred by these methods. `Image::save_png` retains its legacy
 behavior; use `CapturedImage::save_png` to preserve metadata.
 
 ```rust,no_run
-use uareu4500::{metadata::CapturedImage, quality};
+use uareu::{metadata::CapturedImage, quality};
 
 fn inspect() -> anyhow::Result<()> {
     let captured = CapturedImage::load_png("fingerprint.png")?;

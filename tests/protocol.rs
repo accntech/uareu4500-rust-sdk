@@ -5,7 +5,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use uareu4500::protocol::{CaptureEvent, CaptureOptions, Transport, capture};
+use uareu::protocol::{CaptureEvent, CaptureOptions, Transport, capture};
 
 #[derive(Debug, PartialEq)]
 enum Operation {
@@ -163,7 +163,7 @@ fn session_captures_the_synthetic_plain_canvas_and_releases_resources() {
 #[test]
 fn metadata_capture_preserves_cleanup_and_legacy_image_output() {
     let mut model = SensorModel::plain();
-    let captured = uareu4500::protocol::capture_with_metadata(
+    let captured = uareu::protocol::capture_with_metadata(
         &mut model,
         options(),
         &AtomicBool::new(false),
@@ -176,7 +176,7 @@ fn metadata_capture_preserves_cleanup_and_legacy_image_output() {
     );
     assert_eq!(
         captured.metadata.resolution,
-        uareu4500::metadata::Resolution::Unknown
+        uareu::metadata::Resolution::Unknown
     );
     assert!(captured.metadata.valid_region.is_some());
     assert!(model.stopped());
@@ -464,7 +464,7 @@ impl Transport for ContinuousSensor<'_> {
 #[test]
 fn continuous_capture_requires_removal_before_a_second_image() {
     use std::ops::ControlFlow;
-    use uareu4500::protocol::capture_continuous;
+    use uareu::protocol::capture_continuous;
     let cancel = AtomicBool::new(false);
     let mut sensor = ContinuousSensor::new(&cancel);
     let mut events = Vec::new();
@@ -516,7 +516,7 @@ fn continuous_capture_requires_removal_before_a_second_image() {
 #[test]
 fn continuous_capture_held_finger_never_repeats_and_cancellation_cleans_up() {
     use std::ops::ControlFlow;
-    use uareu4500::protocol::capture_continuous;
+    use uareu::protocol::capture_continuous;
     let cancel = AtomicBool::new(false);
     let mut sensor = ContinuousSensor::new(&cancel);
     sensor.removals = [vec![Some(0x0101); 10].into()].into();
@@ -543,7 +543,7 @@ fn continuous_capture_held_finger_never_repeats_and_cancellation_cleans_up() {
 #[test]
 fn continuous_capture_idle_waits_do_not_consume_next_image_deadline() {
     use std::ops::ControlFlow;
-    use uareu4500::protocol::capture_continuous;
+    use uareu::protocol::capture_continuous;
     let cancel = AtomicBool::new(false);
     let mut sensor = ContinuousSensor::new(&cancel);
     let mut delayed = vec![None; 12];
@@ -570,7 +570,7 @@ fn continuous_capture_idle_waits_do_not_consume_next_image_deadline() {
 
 #[test]
 fn continuous_capture_callback_error_stops_and_releases_reader() {
-    use uareu4500::protocol::capture_continuous;
+    use uareu::protocol::capture_continuous;
     let cancel = AtomicBool::new(false);
     let mut sensor = ContinuousSensor::new(&cancel);
     let error = capture_continuous(
@@ -588,7 +588,7 @@ fn continuous_capture_callback_error_stops_and_releases_reader() {
 #[test]
 fn continuous_capture_still_bounds_image_acquisition() {
     use std::ops::ControlFlow;
-    use uareu4500::protocol::capture_continuous;
+    use uareu::protocol::capture_continuous;
     let cancel = AtomicBool::new(false);
     let mut sensor = ContinuousSensor::new(&cancel);
     sensor.image_delay = Duration::from_millis(110);
@@ -609,7 +609,7 @@ fn continuous_capture_still_bounds_image_acquisition() {
 #[test]
 fn continuous_capture_cancellation_after_image_does_not_arm_another_scan() {
     use std::ops::ControlFlow;
-    use uareu4500::protocol::capture_continuous;
+    use uareu::protocol::capture_continuous;
     let cancel = AtomicBool::new(false);
     let mut sensor = ContinuousSensor::new(&cancel);
     capture_continuous(
@@ -634,7 +634,7 @@ fn continuous_capture_cancellation_after_image_does_not_arm_another_scan() {
 
 #[test]
 fn continuous_capture_keeps_callback_errors_even_if_cancelled_concurrently() {
-    use uareu4500::protocol::capture_continuous;
+    use uareu::protocol::capture_continuous;
     let cancel = AtomicBool::new(false);
     let mut sensor = ContinuousSensor::new(&cancel);
     let error = capture_continuous(
@@ -656,7 +656,7 @@ fn continuous_capture_keeps_callback_errors_even_if_cancelled_concurrently() {
 #[test]
 fn continuous_capture_removal_wait_does_not_expire() {
     use std::ops::ControlFlow;
-    use uareu4500::protocol::capture_continuous;
+    use uareu::protocol::capture_continuous;
     let cancel = AtomicBool::new(false);
     let mut sensor = ContinuousSensor::new(&cancel);
     let mut delayed = vec![None; 12];
@@ -688,7 +688,7 @@ fn continuous_capture_removal_wait_does_not_expire() {
 #[test]
 fn continuous_capture_does_not_accept_an_absence_queued_before_removal_mode() {
     use std::ops::ControlFlow;
-    use uareu4500::protocol::capture_continuous;
+    use uareu::protocol::capture_continuous;
     let cancel = AtomicBool::new(false);
     let mut sensor = ContinuousSensor::new(&cancel);
     // A completed capture queues a stale finger-off event. The removal phase
@@ -715,7 +715,7 @@ fn continuous_capture_does_not_accept_an_absence_queued_before_removal_mode() {
 #[test]
 fn continuous_capture_cancelled_preflight_does_not_start_hardware() {
     use std::ops::ControlFlow;
-    use uareu4500::protocol::capture_continuous;
+    use uareu::protocol::capture_continuous;
     let cancel = AtomicBool::new(true);
     let mut sensor = ContinuousSensor::new(&cancel);
     capture_continuous(

@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
-use uareu4500::{
+use uareu::{
     metadata::{CapturedImage, Resolution},
     protocol::{CaptureEvent, CaptureOptions},
     quality::{self, Nfiq2, QualityOutcome},
@@ -18,7 +18,7 @@ use uareu4500::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "UareU 4500 Rust SDK: experimental fingerprint image capture and diagnostics"
+    about = "UareU Rust SDK: experimental fingerprint image capture and diagnostics"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -321,7 +321,7 @@ fn report_event(event: CaptureEvent) {
 
 fn report_saved_image(
     output: &mut impl std::io::Write,
-    image: &uareu4500::frame::Image,
+    image: &uareu::frame::Image,
     path: &std::path::Path,
 ) -> Result<()> {
     writeln!(
@@ -355,8 +355,8 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
-    fn image() -> uareu4500::frame::Image {
-        uareu4500::frame::Image {
+    fn image() -> uareu::frame::Image {
+        uareu::frame::Image {
             width: 2,
             height: 1,
             pixels: vec![0, 255],

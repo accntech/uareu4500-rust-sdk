@@ -54,7 +54,7 @@ jobs:
           cargo test --frozen --all --workspace
       - uses: actions/upload-artifact@v4
         with:
-          name: UareU 4500 Rust SDK-${{ matrix.target }}
+          name: UareU Rust SDK-${{ matrix.target }}
           path: |
             dist/*.tar.gz
             dist/*.sha256

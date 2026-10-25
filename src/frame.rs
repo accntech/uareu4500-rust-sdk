@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Protocol reference: libfprint; Copyright (C) 2007-2008 Daniel Drake,
 // Copyright (C) 2012 Timo Teräs. See NOTICE for license origin and scope.
-// Rust implementation and modifications: 2026-10-25, UareU 4500 Rust SDK contributors.
+// Rust implementation and modifications: 2026-10-25, UareU Rust SDK contributors.
 use std::{fmt, path::Path};
 pub const WIDTH: usize = 384;
 pub const HEIGHT: usize = 290;

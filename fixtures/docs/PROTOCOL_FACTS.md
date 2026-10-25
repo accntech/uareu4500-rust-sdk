@@ -1,4 +1,4 @@
-# UareU 4500 Rust SDK interoperability specification
+# UareU Rust SDK interoperability specification
 
 This specification records community-derived wire formats and mathematical
 behavior, plus project-specific validation and lifecycle policies. It is not a

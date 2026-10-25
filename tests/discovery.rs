@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use nusb::descriptors::ConfigurationDescriptor;
-use uareu4500::usb::{capture_interface, supported_id};
+use uareu::usb::{capture_interface, supported_id};
 
 #[test]
 fn only_the_targeted_digitalpersona_family_can_be_opened() {

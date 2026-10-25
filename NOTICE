@@ -1,5 +1,5 @@
-UareU 4500 Rust SDK — GPL-3.0-or-later
-Copyright (c) 2026 UareU 4500 Rust SDK contributors
+UareU Rust SDK — GPL-3.0-or-later
+Copyright (c) 2026 UareU Rust SDK contributors
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -26,7 +26,7 @@ copy. This does not change the upstream project's license or imply endorsement.
 The upstream copyright and provenance are preserved without claiming that a
 legal finding of derivation or independence has been made.
 
-Changes: 2026-10-25, UareU 4500 Rust SDK contributors. Rust user-space implementation,
+Changes: 2026-10-25, UareU Rust SDK contributors. Rust user-space implementation,
 validated frame layout and decoding, bounded session lifecycle, cancellation,
 phase-specific event handling, Linux/macOS USB transport, CLI, synthetic tests,
 and source-inclusive release packaging. The project was previously offered as

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Opt-in real-engine check; test images and executables are never bundled.
 use std::{fs, path::PathBuf, process::Command, time::Duration};
-use uareu4500::{
+use uareu::{
     frame::Image,
     metadata::{CapturedImage, Resolution},
     quality::{Nfiq2, QualityOutcome},

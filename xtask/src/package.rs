@@ -214,7 +214,7 @@ fn validate_vendor(root: &Path) -> Result<Vec<Value>> {
             .and_then(|v| v.as_str())
             .context("lockfile package lacks version")?;
         let Some(source) = package.get("source").and_then(|v| v.as_str()) else {
-            if !["uareu4500", "xtask"].contains(&name) {
+            if !["uareu", "xtask"].contains(&name) {
                 bail!(
                     "unsupported local dependency {name}; include only reviewed workspace packages"
                 );
@@ -471,8 +471,8 @@ fn build_archive(input: ArchiveInputs<'_>, output: &Path) -> Result<(PathBuf, Pa
     }
     if target.contains("linux") {
         files.insert(
-            "udev/70-uareu4500.rules".into(),
-            read_required(&root.join("udev/70-uareu4500.rules"))?,
+            "udev/70-uareu.rules".into(),
+            read_required(&root.join("udev/70-uareu.rules"))?,
         );
     }
     let file_info: BTreeMap<_, _> = files
@@ -671,7 +671,7 @@ mod tests {
         write(
             &root,
             "Cargo.toml",
-            "[package]\nname='uareu4500'\nversion='0.1.0'\nlicense='GPL-3.0-or-later'\n",
+            "[package]\nname='uareu'\nversion='0.1.0'\nlicense='GPL-3.0-or-later'\n",
         );
         write(
             &root,
@@ -682,7 +682,7 @@ mod tests {
             &root,
             "Cargo.lock",
             format!(
-                "version=4\n[[package]]\nname='uareu4500'\nversion='0.1.0'\n[[package]]\nname='example'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{}'\n",
+                "version=4\n[[package]]\nname='uareu'\nversion='0.1.0'\n[[package]]\nname='example'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{}'\n",
                 "a".repeat(64)
             ),
         );
@@ -692,7 +692,7 @@ mod tests {
             "README.md",
             "src/main.rs",
             "xtask/src/main.rs",
-            "udev/70-uareu4500.rules",
+            "udev/70-uareu.rules",
             "REBUILD.sh",
             "fixtures/synthetic-plain.wire",
             "licenses/supplements/example/LICENSE",
@@ -792,7 +792,7 @@ mod tests {
         let f = fixture();
         let (archive, checksum) = f.build("dist", None).unwrap();
         let files = contents(&archive);
-        let prefix = "uareu4500-0.1.0-aarch64-apple-darwin/";
+        let prefix = "uareu-0.1.0-aarch64-apple-darwin/";
         for name in [
             "source/xtask/src/main.rs",
             "source/xtask/Cargo.toml",
@@ -806,7 +806,7 @@ mod tests {
         ] {
             assert!(files.contains_key(&format!("{prefix}{name}")), "{name}");
         }
-        assert_eq!(files[&format!("{prefix}bin/uareu4500")].0, 0o755);
+        assert_eq!(files[&format!("{prefix}bin/uareu")].0, 0o755);
         assert_eq!(files[&format!("{prefix}source/REBUILD.sh")].0, 0o755);
         assert_eq!(
             files[&format!("{prefix}THIRD_PARTY_NOTICES.md")].1,
@@ -983,8 +983,8 @@ mod tests {
         .unwrap();
         let files = contents(&archive);
         assert_eq!(
-            files["uareu4500-0.1.0-x86_64-unknown-linux-gnu/udev/70-uareu4500.rules"].1,
-            fs::read(f.root.join("udev/70-uareu4500.rules")).unwrap()
+            files["uareu-0.1.0-x86_64-unknown-linux-gnu/udev/70-uareu.rules"].1,
+            fs::read(f.root.join("udev/70-uareu.rules")).unwrap()
         );
     }
     #[test]

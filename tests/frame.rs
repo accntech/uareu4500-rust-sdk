@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use uareu4500::frame::{HEADER_SIZE, HEIGHT, Image, InvalidFrame, WIDTH, decode_frame};
+use uareu::frame::{HEADER_SIZE, HEIGHT, Image, InvalidFrame, WIDTH, decode_frame};
 
 const PLAIN: &[u8] = include_bytes!("../fixtures/synthetic-plain.wire");
 const ENCODED: &[u8] = include_bytes!("../fixtures/synthetic-scrambled.wire");

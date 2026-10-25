@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::{fs, path::PathBuf};
-use uareu4500::{
+use uareu::{
     frame::{HEADER_SIZE, HEIGHT, Image, WIDTH, decode_frame, decode_frame_with_metadata},
     metadata::{
         CaptureMetadata, CapturedImage, ProcessingStep, Region, Resolution, ResolutionProvenance,
@@ -214,6 +214,68 @@ fn nfiq_rejects_unknown_or_non500_resolution_before_starting_an_engine() {
 }
 
 #[test]
+fn renamed_png_key_preserves_legacy_provenance_and_rejects_ambiguous_metadata() {
+    let dir = Directory::new();
+    let metadata = CaptureMetadata {
+        resolution: Resolution::Unknown,
+        valid_region: Some(Region {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }),
+        processing: vec![ProcessingStep::IntensityInversion],
+    };
+    for (index, keys) in [
+        vec!["uareu4500.metadata.v1"],
+        vec!["uareu.metadata.v1"],
+        vec!["uareu4500.metadata.v1", "uareu.metadata.v1"],
+    ]
+    .iter()
+    .enumerate()
+    {
+        let path = dir.0.join(format!("metadata-key-{index}.png"));
+        let mut encoder = png::Encoder::new(fs::File::create(&path).unwrap(), 1, 1);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        for key in keys {
+            encoder
+                .add_itxt_chunk((*key).into(), serde_json::to_string(&metadata).unwrap())
+                .unwrap();
+        }
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&[42])
+            .unwrap();
+        if keys.len() > 1 {
+            assert!(
+                CapturedImage::load_png(path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("duplicate image metadata")
+            );
+            continue;
+        }
+        let loaded = CapturedImage::load_png(path).unwrap();
+        assert_eq!(loaded.metadata, metadata);
+        assert_eq!(loaded.image.pixels, [42]);
+        let output = dir.0.join(format!("rewritten-{index}.png"));
+        loaded.save_png(&output).unwrap();
+        let reader = png::Decoder::new(std::io::BufReader::new(fs::File::open(output).unwrap()))
+            .read_info()
+            .unwrap();
+        let keywords: Vec<_> = reader
+            .info()
+            .utf8_text
+            .iter()
+            .map(|entry| entry.keyword.as_str())
+            .collect();
+        assert_eq!(keywords, ["uareu.metadata.v1"]);
+    }
+}
+
+#[test]
 fn png_rejects_metadata_conflicts_and_non_grayscale_input() {
     let dir = Directory::new();
     for color in [png::ColorType::Grayscale, png::ColorType::Rgb] {
@@ -233,7 +295,7 @@ fn png_rejects_metadata_conflicts_and_non_grayscale_input() {
             };
             encoder
                 .add_itxt_chunk(
-                    "uareu4500.metadata.v1".into(),
+                    "uareu.metadata.v1".into(),
                     serde_json::to_string(&metadata).unwrap(),
                 )
                 .unwrap();
@@ -264,7 +326,7 @@ fn quality_cli_reports_unknown_and_declared_resolution_without_touching_input() 
     .unwrap();
     let original = fs::read(&path).unwrap();
     let run = |args: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_uareu4500"))
+        std::process::Command::new(env!("CARGO_BIN_EXE_uareu"))
             .args(["quality", "--input"])
             .arg(&path)
             .args(args)
