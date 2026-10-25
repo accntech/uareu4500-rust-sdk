@@ -14,8 +14,7 @@ pub struct Image {
     pub pixels: Vec<u8>,
 }
 impl Image {
-    pub fn save_png(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
-        use std::io::Write;
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.width > 0 && self.height > 0,
             "image dimensions must be nonzero"
@@ -23,6 +22,25 @@ impl Image {
         anyhow::ensure!(
             self.width.checked_mul(self.height) == Some(self.pixels.len()),
             "image pixel count does not match dimensions"
+        );
+        Ok(())
+    }
+    pub fn save_png(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        self.save_png_with_metadata(path.as_ref(), None)
+    }
+    pub(crate) fn save_png_with_metadata(
+        &self,
+        path: &Path,
+        metadata: Option<&crate::metadata::CaptureMetadata>,
+    ) -> anyhow::Result<()> {
+        use std::io::Write;
+        self.validate()?;
+        let metadata_text = metadata.map(serde_json::to_string).transpose()?;
+        anyhow::ensure!(
+            metadata_text
+                .as_ref()
+                .is_none_or(|text| text.len() <= 16_384),
+            "image metadata exceeds 16 KiB"
         );
         let width = u32::try_from(self.width)?;
         let height = u32::try_from(self.height)?;
@@ -38,6 +56,10 @@ impl Image {
             let mut encoder = png::Encoder::new(&mut file, width, height);
             encoder.set_color(png::ColorType::Grayscale);
             encoder.set_depth(png::BitDepth::Eight);
+            if let (Some(metadata), Some(text)) = (metadata, metadata_text) {
+                encoder.set_pixel_dims(metadata.resolution.pixel_dimensions());
+                encoder.add_itxt_chunk(crate::metadata::PNG_METADATA_KEY.into(), text)?;
+            }
             let mut writer = encoder.write_header()?;
             writer.write_image_data(&self.pixels)?;
             writer.finish()?;
@@ -127,8 +149,18 @@ fn mask(state: u32) -> u8 {
 pub fn decode_frame(
     bytes: &[u8],
     rotate180: bool,
-    mut key: impl FnMut(u8) -> anyhow::Result<u32>,
+    key: impl FnMut(u8) -> anyhow::Result<u32>,
 ) -> anyhow::Result<Image> {
+    Ok(decode_frame_with_metadata(bytes, rotate180, key)?.image)
+}
+
+/// Decode with padding/processing provenance. USB identity does not prove PPI.
+pub fn decode_frame_with_metadata(
+    bytes: &[u8],
+    rotate180: bool,
+    mut key: impl FnMut(u8) -> anyhow::Result<u32>,
+) -> anyhow::Result<crate::metadata::CapturedImage> {
+    use crate::metadata::{CaptureMetadata, CapturedImage, ProcessingStep, Region, Resolution};
     // Complete structural validation precedes all external key operations.
     let spans = layout(bytes)?;
     let rows = usize::from(u16::from_le_bytes([bytes[4], bytes[5]]));
@@ -179,10 +211,34 @@ pub fn decode_frame(
     if rotate180 {
         pixels.reverse();
     }
-    Ok(Image {
-        width: WIDTH,
-        height: HEIGHT,
-        pixels,
+    let populated_rows = destination / WIDTH;
+    let mut processing = vec![
+        ProcessingStep::DescriptorExpansion,
+        ProcessingStep::IntensityInversion,
+    ];
+    if rotate180 {
+        processing.push(ProcessingStep::Rotate180);
+    }
+    Ok(CapturedImage {
+        image: Image {
+            width: WIDTH,
+            height: HEIGHT,
+            pixels,
+        },
+        metadata: CaptureMetadata {
+            resolution: Resolution::Unknown,
+            valid_region: Some(Region {
+                x: 0,
+                y: if rotate180 {
+                    HEIGHT - populated_rows
+                } else {
+                    0
+                },
+                width: WIDTH,
+                height: populated_rows,
+            }),
+            processing,
+        },
     })
 }
 #[cfg(test)]

@@ -9,14 +9,16 @@ use std::{
     time::Duration,
 };
 use uareu4500::{
+    metadata::{CapturedImage, Resolution},
     protocol::{CaptureEvent, CaptureOptions},
+    quality::{self, Nfiq2, QualityOutcome},
     usb::{Reader, readers},
 };
 
 #[derive(Parser)]
 #[command(
     version,
-    about = "UareU 4500 Rust SDK: experimental image capture for Linux and macOS"
+    about = "UareU 4500 Rust SDK: experimental fingerprint image capture and diagnostics"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -31,6 +33,22 @@ enum Commands {
         /// Also list other USB devices for detection troubleshooting.
         #[arg(long)]
         all: bool,
+    },
+    /// Inspect an 8-bit grayscale PNG offline; optionally run NFIQ 2 v2.3.0.
+    Quality {
+        #[arg(long)]
+        input: PathBuf,
+        /// Explicit square-pixel resolution declaration; does not resample pixels.
+        #[arg(long)]
+        ppi: Option<f64>,
+        /// File path of an externally installed NFIQ 2 v2.3.0 executable.
+        #[arg(long)]
+        nfiq2: Option<PathBuf>,
+        /// Model information file passed to NFIQ 2; contains a Path entry.
+        #[arg(long, requires = "nfiq2")]
+        nfiq2_model: Option<PathBuf>,
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=300))]
+        engine_timeout: u64,
     },
     /// Save a fingerprint image, or keep scanning after each finger removal.
     Capture {
@@ -57,6 +75,9 @@ enum Commands {
         /// Keep sensor orientation instead of the default 180-degree rotation.
         #[arg(long)]
         no_rotate: bool,
+        /// Explicit output PPI declaration; unknown by default. Does not resample.
+        #[arg(long)]
+        ppi: Option<f64>,
     },
 }
 fn run() -> Result<()> {
@@ -100,6 +121,33 @@ fn run() -> Result<()> {
                 );
             }
         }
+        Commands::Quality {
+            input,
+            ppi,
+            nfiq2,
+            nfiq2_model,
+            engine_timeout,
+        } => {
+            let mut captured = CapturedImage::load_png(input)?;
+            if let Some(ppi) = ppi {
+                captured.metadata.resolution = Resolution::declared(ppi, ppi)?;
+            }
+            let engine = nfiq2.map(|executable| Nfiq2 {
+                executable,
+                model_info: nfiq2_model,
+                timeout: Duration::from_secs(engine_timeout),
+            });
+            let report = quality::assess(&captured, engine.as_ref())?;
+            serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
+            println!();
+            ensure!(
+                matches!(
+                    report.quality,
+                    QualityOutcome::NotEvaluated | QualityOutcome::Scored { .. }
+                ),
+                "quality evaluation did not produce a score; see the JSON status"
+            );
+        }
         Commands::Capture {
             output,
             continuous,
@@ -107,7 +155,9 @@ fn run() -> Result<()> {
             timeout,
             device,
             no_rotate,
+            ppi,
         } => {
+            let declared_ppi = ppi.map(|ppi| Resolution::declared(ppi, ppi)).transpose()?;
             ensure!(
                 continuous || output_dir.is_none(),
                 "--output-dir requires --continuous"
@@ -151,20 +201,32 @@ fn run() -> Result<()> {
                 rotate180: !no_rotate,
             };
             if let Some(files) = &mut files {
-                reader.capture_continuous(options, &cancelled, report_event, |image| {
-                    let path = files.save(&image)?;
-                    report_saved_image(&mut std::io::stdout().lock(), &image, &path)?;
-                    Ok(std::ops::ControlFlow::Continue(()))
-                })?;
+                reader.capture_continuous_with_metadata(
+                    options,
+                    &cancelled,
+                    report_event,
+                    |mut captured| {
+                        if let Some(resolution) = &declared_ppi {
+                            captured.metadata.resolution = resolution.clone();
+                        }
+                        let path = files.save(&captured)?;
+                        report_saved_image(&mut std::io::stdout().lock(), &captured.image, &path)?;
+                        Ok(std::ops::ControlFlow::Continue(()))
+                    },
+                )?;
                 println!("Continuous scanning stopped.");
             } else {
-                let image = reader.capture(options, &cancelled, report_event)?;
+                let mut captured =
+                    reader.capture_with_metadata(options, &cancelled, report_event)?;
+                if let Some(resolution) = declared_ppi {
+                    captured.metadata.resolution = resolution;
+                }
                 let output = output.context("single capture requires --output")?;
-                image.save_png(&output)?;
+                captured.save_png(&output)?;
                 println!(
                     "Saved {} x {} grayscale image to {}",
-                    image.width,
-                    image.height,
+                    captured.image.width,
+                    captured.image.height,
                     output.display()
                 );
             }
@@ -210,7 +272,7 @@ impl ContinuousFiles {
             next: 1,
         })
     }
-    fn save(&mut self, image: &uareu4500::frame::Image) -> Result<PathBuf> {
+    fn save(&mut self, image: &CapturedImage) -> Result<PathBuf> {
         for _ in 0..1000 {
             let path = self
                 .directory
@@ -305,8 +367,8 @@ mod tests {
         let temp = TestDirectory::new();
         let directory = temp.0.join("new");
         let mut files = ContinuousFiles::new(directory.clone()).unwrap();
-        let first = files.save(&image()).unwrap();
-        let second = files.save(&image()).unwrap();
+        let first = files.save(&CapturedImage::new(image())).unwrap();
+        let second = files.save(&CapturedImage::new(image())).unwrap();
         assert_ne!(first, second);
         assert_eq!(first.parent(), Some(directory.as_path()));
         for path in [first, second] {
@@ -334,7 +396,7 @@ mod tests {
         let mut files = ContinuousFiles::new(temp.0.clone()).unwrap();
         let existing = temp.0.join(format!("{}-000001.png", files.prefix));
         fs::write(&existing, b"keep me").unwrap();
-        let saved = files.save(&image()).unwrap();
+        let saved = files.save(&CapturedImage::new(image())).unwrap();
         assert_ne!(saved, existing);
         assert_eq!(fs::read(existing).unwrap(), b"keep me");
         assert!(saved.is_file());

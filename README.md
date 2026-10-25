@@ -102,6 +102,100 @@ any reader interface held by fprintd or other software before direct capture.
 On macOS, approve the USB accessory if prompted. The backend uses IOKit; no kext
 or DriverKit extension is required. This does not integrate with Apple Touch ID.
 
+## Image metadata and offline quality
+
+Resolution is **unknown by default**. A reader's USB ID, product name, or nominal
+datasheet resolution does not establish the effective PPI of this decoder's
+output. Neither capture nor quality inspection assumes 500 or 512 PPI.
+
+The CLI now saves processing and descriptor-coverage metadata in PNG iTXt under
+`uareu4500.metadata.v1`. Known resolution is also written to the PNG `pHYs` chunk
+as pixels per metre, rounded to the nearest integer. Unknown resolution omits
+`pHYs`. Metadata records its source, not a claim of independently verified
+hardware calibration. Metadata edited outside this application remains an
+untrusted declaration; imports reject conflicting metadata and `pHYs` values.
+
+Inspect a previously captured image without opening USB hardware:
+
+```powershell
+.\target\release\uareu4500.exe quality --input fingerprint.png
+```
+
+The JSON report contains resolution provenance, known processing, and image
+diagnostics: minimum/maximum intensity, mean, population standard deviation,
+fractions at 0 and 255, and known padding coverage. When descriptor coverage is
+available, diagnostics exclude only the known padding. That region is not finger
+segmentation. Older PNGs have unknown padding and processing history. These
+diagnostics do not establish biometric quality, identity, or liveness.
+
+`capture --ppi VALUE` explicitly declares square-pixel output resolution and
+records `caller_declared` provenance. `quality --ppi VALUE` overrides the input's
+resolution for that report only, also as a caller declaration. Both options leave
+pixels unchanged: **declaring PPI does not resample an image**. Use a declaration
+only when the actual output resolution has been established independently.
+
+### Optional NFIQ 2
+
+Install a reference [NIST NFIQ 2 v2.3.0 CLI](https://github.com/usnistgov/NFIQ2/releases/tag/v2.3.0)
+separately. No quality engine is downloaded, bundled, or required for capture.
+For an image already established as 500 PPI on both axes:
+
+```powershell
+.\target\release\uareu4500.exe quality --input known-500ppi.png --nfiq2 C:\NFIQ2\bin\nfiq2.exe
+```
+
+Embedded-model builds identify the model through the executable SHA-256. For a
+build using an external model, add `--nfiq2-model C:\NFIQ2\nist_plain_tir-ink.txt`.
+The adapter passes this information file to the engine and records SHA-256 hashes
+of both the information file and the referenced model data. Supplying a model
+file to an embedded-model build is rejected because that build ignores the option.
+
+The adapter checks the reported version, uses a private temporary grayscale PNG,
+and removes its workspace on normal return, including evaluation failures. On
+Unix the temporary directory is mode `0700` and files are `0600`; Windows uses
+the current user's temporary-directory ACLs. Child processes run without a shell,
+with a per-process deadline (`--engine-timeout`, default 10 seconds, maximum 300)
+and bounded output reads; excessive output terminates evaluation. Abrupt process
+termination can leave temporary files, so do not treat cleanup as secure erasure.
+
+Unknown resolution and non-500-PPI input produce `unsupported_input`. Resampling
+is not implemented. Only PNG encoding round-off (at most about 0.013 PPI per axis)
+is tolerated. Known descriptor padding is cropped for evaluation and the crop is
+reported. The engine may reject images further after its own whitespace cropping.
+Unexpected engine quantization/resampling is rejected rather than silently accepted.
+
+Without an engine the outcome is `not_evaluated`. Other outcomes are
+`engine_unavailable`, `evaluation_failed`, or `scored`. The latter contains an
+NFIQ 2 score in `0..100` (higher is better), engine/model identity, and upstream
+actionable measures. A failure is never represented by a score of zero. Quality
+evaluation failures retain diagnostics in JSON and return a nonzero CLI exit
+status; successful scoring and diagnostics-only inspection exit successfully.
+Malformed input fails before a report is produced. No automatic acceptance
+threshold or capture rejection is applied. NFIQ 2 is not the legacy NFIQ 1 score
+provided by the U.are.U 3.0 SDK; there is no score conversion or SDK-parity claim.
+
+The [pinned CLI contract](https://github.com/usnistgov/NFIQ2/blob/v2.3.0/NFIQ2/NFIQ2Algorithm/doc/nfiq2_tool.1.md)
+defines input restrictions. Tests use a process fixture to exercise parsing,
+version/model handling, failures, output limits, and deadlines; that fixture does
+not implement biometric scoring. NIST's separately licensed conformance images
+are not included. Real-engine conformance and recognition accuracy require
+independent testing.
+
+An opt-in integration test compares the real CLI's PGM score with the adapter's
+PNG score on identical synthetic pixels. Supply the executable, its external
+model information (omit this variable for embedded-model builds), and a
+synthetic 500-PPI P5 PGM such as the upstream `examples/images/SFinGe_Test01.pgm`:
+
+```powershell
+$env:UAREU_NFIQ2_EXE = 'C:\NFIQ2\bin\nfiq2.exe'
+$env:UAREU_NFIQ2_MODEL = 'C:\NFIQ2\nist_plain_tir-ink.txt'
+$env:UAREU_NFIQ2_TEST_PGM = 'C:\test-data\SFinGe_Test01.pgm'
+cargo test --locked --test nfiq2_reference -- --ignored --nocapture
+```
+
+This adapter check is separate from the NIST conformance suite and does not
+establish recognition accuracy or the resolution of physical-reader captures.
+
 ## Rust library
 
 ```rust,no_run
@@ -132,6 +226,30 @@ an image callback returning `anyhow::Result<std::ops::ControlFlow<()>>`. Return
 `Continue(())` for another scan or `Break(())` to finish. The SDK waits for actual
 finger removal between scans. Callback errors stop the session and propagate to
 the caller after cleanup; cancellation stops continuous scanning gracefully.
+
+The existing `Image`, `decode_frame`, `Reader::capture`, and
+`Reader::capture_continuous` APIs retain their signatures and pixel output.
+Metadata-bearing variants are `frame::decode_frame_with_metadata`,
+`Reader::capture_with_metadata`, and `Reader::capture_continuous_with_metadata`;
+the same variants are available in `protocol` for simulated transports. They
+return `metadata::CapturedImage`, which wraps the original `Image` with
+`CaptureMetadata`. Rotation transforms descriptor coverage along with pixels.
+No resolution is inferred by these methods. `Image::save_png` retains its legacy
+behavior; use `CapturedImage::save_png` to preserve metadata.
+
+```rust,no_run
+use uareu4500::{metadata::CapturedImage, quality};
+
+fn inspect() -> anyhow::Result<()> {
+    let captured = CapturedImage::load_png("fingerprint.png")?;
+    let report = quality::assess(&captured, None)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+```
+
+`quality::Nfiq2` supplies the optional engine configuration. Keep this offline
+assessment separate from capture callbacks when cancellation latency matters.
 
 ## Tests and fixtures
 

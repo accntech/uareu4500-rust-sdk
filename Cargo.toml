@@ -13,6 +13,9 @@ ctrlc = "3"
 getrandom = { version = "0.3", features = ["std"] }
 nusb = "0.2.9"
 png = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
 
 [lib]
 path = "src/lib.rs"

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+use crate::metadata::CapturedImage;
 use crate::{
     frame::{Image, MAX_FRAME_SIZE},
     protocol::{self, CaptureEvent, CaptureOptions, Transport},
@@ -121,6 +122,33 @@ impl Reader {
         event: impl FnMut(CaptureEvent),
     ) -> Result<Image> {
         protocol::capture(&mut self.transport, options, cancel, event)
+    }
+
+    /// Single capture with processing/coverage metadata and unknown resolution.
+    pub fn capture_with_metadata(
+        mut self,
+        options: CaptureOptions,
+        cancel: &AtomicBool,
+        event: impl FnMut(CaptureEvent),
+    ) -> Result<CapturedImage> {
+        protocol::capture_with_metadata(&mut self.transport, options, cancel, event)
+    }
+
+    /// Successive placements with metadata, retaining existing cleanup semantics.
+    pub fn capture_continuous_with_metadata(
+        mut self,
+        options: CaptureOptions,
+        cancel: &AtomicBool,
+        event: impl FnMut(CaptureEvent),
+        image: impl FnMut(CapturedImage) -> Result<std::ops::ControlFlow<()>>,
+    ) -> Result<()> {
+        protocol::capture_continuous_with_metadata(
+            &mut self.transport,
+            options,
+            cancel,
+            event,
+            image,
+        )
     }
     /// Capture each placement, waiting for finger removal between images.
     /// The callback can break to stop. Cancellation also stops successfully;

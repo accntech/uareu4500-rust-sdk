@@ -161,6 +161,28 @@ fn session_captures_the_synthetic_plain_canvas_and_releases_resources() {
 }
 
 #[test]
+fn metadata_capture_preserves_cleanup_and_legacy_image_output() {
+    let mut model = SensorModel::plain();
+    let captured = uareu4500::protocol::capture_with_metadata(
+        &mut model,
+        options(),
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(
+        captured.image.pixels.as_slice(),
+        include_bytes!("../fixtures/synthetic-plain.gray")
+    );
+    assert_eq!(
+        captured.metadata.resolution,
+        uareu4500::metadata::Resolution::Unknown
+    );
+    assert!(captured.metadata.valid_region.is_some());
+    assert!(model.stopped());
+}
+
+#[test]
 fn session_performs_fresh_seed_exchanges_for_each_synthetic_key_index() {
     let mut model = SensorModel::new(include_bytes!("../fixtures/synthetic-scrambled.wire"));
     let image = capture(&mut model, options(), &AtomicBool::new(false), |_| {}).unwrap();

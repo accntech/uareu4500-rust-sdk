@@ -3,6 +3,7 @@
 // Copyright (C) 2012 Timo Teräs. See NOTICE for license origin and scope.
 // Rust implementation and modifications: 2026-10-25, UareU 4500 Rust SDK contributors.
 use crate::frame::Image;
+use crate::metadata::CapturedImage;
 use std::{sync::atomic::AtomicBool, time::Duration};
 pub trait Transport {
     fn read_registers(
@@ -223,7 +224,7 @@ impl<T: Transport> Session<'_, T> {
         &mut self,
         options: CaptureOptions,
         callback: &mut impl FnMut(CaptureEvent),
-    ) -> anyhow::Result<Image> {
+    ) -> anyhow::Result<CapturedImage> {
         self.notify(CaptureEvent::Capturing, callback)?;
         for _ in 0..3 {
             self.check()?;
@@ -240,22 +241,23 @@ impl<T: Transport> Session<'_, T> {
                 self.poll(Duration::ZERO)?;
                 self.pause(Duration::from_millis(1))?;
             };
-            let decoded = crate::frame::decode_frame(&bytes, options.rotate180, |index| {
-                self.check()?;
-                let mut entropy = [0u8; 4];
-                getrandom::fill(&mut entropy)?;
-                let seed = u32::from_le_bytes(entropy) & 0x7fff_ffff;
-                let mut request = [0u8; 5];
-                request[0] = index;
-                request[1..].copy_from_slice(&seed.to_le_bytes());
-                self.write(0x33, &request)?;
-                let response = self.read(0x34, 4)?;
-                Ok(u32::from_le_bytes(
-                    response
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("invalid image key length"))?,
-                ) ^ seed)
-            });
+            let decoded =
+                crate::frame::decode_frame_with_metadata(&bytes, options.rotate180, |index| {
+                    self.check()?;
+                    let mut entropy = [0u8; 4];
+                    getrandom::fill(&mut entropy)?;
+                    let seed = u32::from_le_bytes(entropy) & 0x7fff_ffff;
+                    let mut request = [0u8; 5];
+                    request[0] = index;
+                    request[1..].copy_from_slice(&seed.to_le_bytes());
+                    self.write(0x33, &request)?;
+                    let response = self.read(0x34, 4)?;
+                    Ok(u32::from_le_bytes(
+                        response
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("invalid image key length"))?,
+                    ) ^ seed)
+                });
             self.check()?;
             match decoded {
                 Ok(image) => return Ok(image),
@@ -269,7 +271,7 @@ impl<T: Transport> Session<'_, T> {
         &mut self,
         options: CaptureOptions,
         callback: &mut impl FnMut(CaptureEvent),
-    ) -> anyhow::Result<Image> {
+    ) -> anyhow::Result<CapturedImage> {
         self.initialize(callback)?;
         self.wait_for_finger(true, callback)?;
         self.acquire_image(options, callback)
@@ -278,7 +280,7 @@ impl<T: Transport> Session<'_, T> {
         &mut self,
         options: CaptureOptions,
         callback: &mut impl FnMut(CaptureEvent),
-        image: &mut impl FnMut(Image) -> anyhow::Result<std::ops::ControlFlow<()>>,
+        image: &mut impl FnMut(CapturedImage) -> anyhow::Result<std::ops::ControlFlow<()>>,
     ) -> anyhow::Result<()> {
         self.initialize(callback)?;
         loop {
@@ -328,8 +330,18 @@ pub fn capture(
     transport: &mut impl Transport,
     options: CaptureOptions,
     cancel: &AtomicBool,
-    mut event: impl FnMut(CaptureEvent),
+    event: impl FnMut(CaptureEvent),
 ) -> anyhow::Result<Image> {
+    Ok(capture_with_metadata(transport, options, cancel, event)?.image)
+}
+
+/// Capture with descriptor coverage and processing provenance; resolution is unknown.
+pub fn capture_with_metadata(
+    transport: &mut impl Transport,
+    options: CaptureOptions,
+    cancel: &AtomicBool,
+    mut event: impl FnMut(CaptureEvent),
+) -> anyhow::Result<CapturedImage> {
     let now = std::time::Instant::now();
     let Some(deadline) = now.checked_add(options.timeout) else {
         transport.cancel();
@@ -360,8 +372,21 @@ pub fn capture_continuous(
     transport: &mut impl Transport,
     options: CaptureOptions,
     cancel: &AtomicBool,
-    mut event: impl FnMut(CaptureEvent),
+    event: impl FnMut(CaptureEvent),
     mut image: impl FnMut(Image) -> anyhow::Result<std::ops::ControlFlow<()>>,
+) -> anyhow::Result<()> {
+    capture_continuous_with_metadata(transport, options, cancel, event, |captured| {
+        image(captured.image)
+    })
+}
+
+/// Continuous capture retaining metadata for each image. No quality work runs here.
+pub fn capture_continuous_with_metadata(
+    transport: &mut impl Transport,
+    options: CaptureOptions,
+    cancel: &AtomicBool,
+    mut event: impl FnMut(CaptureEvent),
+    mut image: impl FnMut(CapturedImage) -> anyhow::Result<std::ops::ControlFlow<()>>,
 ) -> anyhow::Result<()> {
     let Some(deadline) = std::time::Instant::now().checked_add(options.timeout) else {
         transport.cancel();
