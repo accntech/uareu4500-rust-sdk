@@ -24,6 +24,8 @@ pub trait Transport {
 }
 #[derive(Copy, Debug, Clone)]
 pub struct CaptureOptions {
+    /// Overall deadline for a single capture; initialization/acquisition deadline
+    /// for continuous capture, excluding idle placement/removal waits.
     pub timeout: Duration,
     pub rotate180: bool,
 }
@@ -39,34 +41,45 @@ impl Default for CaptureOptions {
 pub enum CaptureEvent {
     Initializing,
     WaitingForFinger,
+    WaitingForFingerRemoval,
     Capturing,
 }
+#[derive(Debug)]
+struct CaptureCancelled;
+impl std::fmt::Display for CaptureCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("capture cancelled")
+    }
+}
+impl std::error::Error for CaptureCancelled {}
+
 struct Session<'a, T: Transport> {
     io: &'a mut T,
     cancel: &'a AtomicBool,
-    deadline: std::time::Instant,
+    deadline: Option<std::time::Instant>,
     active: bool,
     ready: bool,
     finger: bool,
 }
 impl<T: Transport> Session<'_, T> {
     fn check(&self) -> anyhow::Result<()> {
+        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(CaptureCancelled.into());
+        }
         anyhow::ensure!(
-            !self.cancel.load(std::sync::atomic::Ordering::Relaxed),
-            "capture cancelled"
-        );
-        anyhow::ensure!(
-            std::time::Instant::now() < self.deadline,
+            self.deadline
+                .is_none_or(|deadline| std::time::Instant::now() < deadline),
             "capture deadline exceeded"
         );
         Ok(())
     }
     fn allowance(&self) -> anyhow::Result<Duration> {
         self.check()?;
-        Ok(self
-            .deadline
-            .saturating_duration_since(std::time::Instant::now())
-            .min(Duration::from_millis(50)))
+        Ok(self.deadline.map_or(Duration::from_millis(50), |deadline| {
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(Duration::from_millis(50))
+        }))
     }
     fn read(&mut self, register: u16, length: u16) -> anyhow::Result<Vec<u8>> {
         let timeout = self.allowance()?;
@@ -111,12 +124,9 @@ impl<T: Transport> Session<'_, T> {
     }
     fn pause(&self, duration: Duration) -> anyhow::Result<()> {
         self.check()?;
-        std::thread::sleep(
-            duration.min(
-                self.deadline
-                    .saturating_duration_since(std::time::Instant::now()),
-            ),
-        );
+        std::thread::sleep(duration.min(self.deadline.map_or(duration, |deadline| {
+            deadline.saturating_duration_since(std::time::Instant::now())
+        })));
         self.check()
     }
     fn notify(
@@ -178,25 +188,42 @@ impl<T: Transport> Session<'_, T> {
         }
         anyhow::bail!("reader did not become power ready")
     }
-    fn run(
-        &mut self,
-        options: CaptureOptions,
-        callback: &mut impl FnMut(CaptureEvent),
-    ) -> anyhow::Result<Image> {
+    fn initialize(&mut self, callback: &mut impl FnMut(CaptureEvent)) -> anyhow::Result<()> {
         self.notify(CaptureEvent::Initializing, callback)?;
         self.active = true;
         self.power_up()?;
         self.read(0xf0, 16)?;
-        self.notify(CaptureEvent::WaitingForFinger, callback)?;
+        Ok(())
+    }
+    fn wait_for_finger(
+        &mut self,
+        present: bool,
+        callback: &mut impl FnMut(CaptureEvent),
+    ) -> anyhow::Result<()> {
+        self.notify(
+            if present {
+                CaptureEvent::WaitingForFinger
+            } else {
+                CaptureEvent::WaitingForFingerRemoval
+            },
+            callback,
+        )?;
         self.discard_queued_events()?;
-        self.finger = false;
-        self.write(0x4e, &[0x10])?;
-        while !self.finger {
+        self.finger = !present;
+        self.write(0x4e, &[if present { 0x10 } else { 0x12 }])?;
+        while self.finger != present {
             self.poll(Duration::from_millis(20))?;
-            if !self.finger {
+            if self.finger != present {
                 self.pause(Duration::from_millis(1))?;
             }
         }
+        Ok(())
+    }
+    fn acquire_image(
+        &mut self,
+        options: CaptureOptions,
+        callback: &mut impl FnMut(CaptureEvent),
+    ) -> anyhow::Result<Image> {
         self.notify(CaptureEvent::Capturing, callback)?;
         for _ in 0..3 {
             self.check()?;
@@ -238,6 +265,42 @@ impl<T: Transport> Session<'_, T> {
         }
         anyhow::bail!("reader returned three invalid frames")
     }
+    fn run(
+        &mut self,
+        options: CaptureOptions,
+        callback: &mut impl FnMut(CaptureEvent),
+    ) -> anyhow::Result<Image> {
+        self.initialize(callback)?;
+        self.wait_for_finger(true, callback)?;
+        self.acquire_image(options, callback)
+    }
+    fn run_continuous(
+        &mut self,
+        options: CaptureOptions,
+        callback: &mut impl FnMut(CaptureEvent),
+        image: &mut impl FnMut(Image) -> anyhow::Result<std::ops::ControlFlow<()>>,
+    ) -> anyhow::Result<()> {
+        self.initialize(callback)?;
+        loop {
+            // Finger placement/removal may take arbitrarily long. USB operations
+            // still use short bounded allowances and always observe cancellation.
+            self.deadline = None;
+            self.wait_for_finger(true, callback)?;
+            self.deadline = Some(
+                std::time::Instant::now()
+                    .checked_add(options.timeout)
+                    .ok_or_else(|| anyhow::anyhow!("capture timeout is out of range"))?,
+            );
+            let captured = self.acquire_image(options, callback)?;
+            let action = image(captured)?;
+            if action.is_break() {
+                return Ok(());
+            }
+            self.deadline = None;
+            self.check()?;
+            self.wait_for_finger(false, callback)?;
+        }
+    }
     fn cleanup(&mut self) -> anyhow::Result<()> {
         let mut first_error = None;
         if self.active {
@@ -275,7 +338,7 @@ pub fn capture(
     let mut session = Session {
         io: transport,
         cancel,
-        deadline,
+        deadline: Some(deadline),
         active: false,
         ready: false,
         finger: false,
@@ -290,6 +353,36 @@ pub fn capture(
         }
     }
 }
+/// Capture successive finger placements until cancelled or the callback breaks.
+/// Inactivity while waiting for placement/removal is unlimited; initialization
+/// and each image acquisition retain `options.timeout` deadlines.
+pub fn capture_continuous(
+    transport: &mut impl Transport,
+    options: CaptureOptions,
+    cancel: &AtomicBool,
+    mut event: impl FnMut(CaptureEvent),
+    mut image: impl FnMut(Image) -> anyhow::Result<std::ops::ControlFlow<()>>,
+) -> anyhow::Result<()> {
+    let Some(deadline) = std::time::Instant::now().checked_add(options.timeout) else {
+        transport.cancel();
+        anyhow::bail!("capture timeout is out of range");
+    };
+    let mut session = Session {
+        io: transport,
+        cancel,
+        deadline: Some(deadline),
+        active: false,
+        ready: false,
+        finger: false,
+    };
+    let outcome = session.run_continuous(options, &mut event, &mut image);
+    let cleanup = session.cleanup();
+    match outcome {
+        Err(error) if !error.is::<CaptureCancelled>() => Err(error),
+        _ => cleanup,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

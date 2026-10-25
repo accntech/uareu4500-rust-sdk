@@ -56,7 +56,7 @@ pub fn readers() -> Result<Vec<DeviceInfo>> {
     Ok(readers)
 }
 
-/// An exclusively opened, single-capture reader. Drop releases its USB interface.
+/// An exclusively opened reader. Drop releases its USB interface.
 pub struct Reader {
     transport: UsbTransport,
 }
@@ -121,6 +121,18 @@ impl Reader {
         event: impl FnMut(CaptureEvent),
     ) -> Result<Image> {
         protocol::capture(&mut self.transport, options, cancel, event)
+    }
+    /// Capture each placement, waiting for finger removal between images.
+    /// The callback can break to stop. Cancellation also stops successfully;
+    /// device, image, callback, and cleanup failures remain errors.
+    pub fn capture_continuous(
+        mut self,
+        options: CaptureOptions,
+        cancel: &AtomicBool,
+        event: impl FnMut(CaptureEvent),
+        image: impl FnMut(Image) -> Result<std::ops::ControlFlow<()>>,
+    ) -> Result<()> {
+        protocol::capture_continuous(&mut self.transport, options, cancel, event, image)
     }
 }
 

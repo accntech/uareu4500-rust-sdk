@@ -47,3 +47,44 @@ fn license_command_shows_gpl_grant_attribution_and_warranty_terms() {
     assert!(text.contains("GNU GENERAL PUBLIC LICENSE"));
     assert!(text.contains("NO WARRANTY") || text.contains("Disclaimer of Warranty"));
 }
+
+#[test]
+fn capture_help_documents_continuous_mode_and_directory() {
+    let output = Command::new(env!("CARGO_BIN_EXE_uareu4500"))
+        .args(["capture", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("--continuous"), "{help}");
+    assert!(help.contains("--output-dir"), "{help}");
+}
+
+#[test]
+fn continuous_mode_rejects_single_output_before_usb_access() {
+    let output = Command::new(env!("CARGO_BIN_EXE_uareu4500"))
+        .args(["capture", "--continuous", "--output", "unused.png"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("cannot be used with"), "{error}");
+}
+
+#[test]
+fn output_directory_requires_continuous_mode_before_usb_access() {
+    let output = Command::new(env!("CARGO_BIN_EXE_uareu4500"))
+        .args([
+            "capture",
+            "--output",
+            "unused.png",
+            "--output-dir",
+            "unused",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("--continuous"), "{error}");
+    assert!(!error.contains("Initializing reader"), "{error}");
+}

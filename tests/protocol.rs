@@ -342,3 +342,367 @@ fn a_stale_finger_present_cannot_override_its_queued_absence() {
     assert!(!model.operations.contains(&Operation::QueueImage));
     assert!(model.stopped());
 }
+
+struct ContinuousSensor<'a> {
+    inner: SensorModel,
+    cancel: &'a AtomicBool,
+    placements: VecDeque<VecDeque<Option<u16>>>,
+    removals: VecDeque<VecDeque<Option<u16>>>,
+    pending: VecDeque<Option<u16>>,
+    waiting_for_removal: bool,
+    removal_polls: usize,
+    cancel_after_removal_polls: Option<usize>,
+    idle_delay: Duration,
+    image_delay: Duration,
+    stale_absence_after_image: bool,
+}
+impl<'a> ContinuousSensor<'a> {
+    fn new(cancel: &'a AtomicBool) -> Self {
+        let mut inner = SensorModel::plain();
+        inner.supply_finger = false;
+        inner
+            .images
+            .push_back(include_bytes!("../fixtures/synthetic-plain.wire").to_vec());
+        Self {
+            inner,
+            cancel,
+            placements: [vec![Some(0x0101)].into(), vec![Some(0x0101)].into()].into(),
+            removals: [vec![Some(0x0101), None, Some(0x0200)].into()].into(),
+            pending: VecDeque::new(),
+            waiting_for_removal: false,
+            removal_polls: 0,
+            cancel_after_removal_polls: None,
+            idle_delay: Duration::ZERO,
+            image_delay: Duration::ZERO,
+            stale_absence_after_image: false,
+        }
+    }
+}
+impl Transport for ContinuousSensor<'_> {
+    fn read_registers(&mut self, register: u16, length: u16, timeout: Duration) -> Result<Vec<u8>> {
+        self.inner.read_registers(register, length, timeout)
+    }
+    fn write_registers(&mut self, register: u16, data: &[u8], timeout: Duration) -> Result<()> {
+        self.inner.write_registers(register, data, timeout)?;
+        if register == 0x4e {
+            match data {
+                [0x10] => {
+                    self.waiting_for_removal = false;
+                    self.pending = self.placements.pop_front().unwrap_or_default();
+                }
+                [0x12] => {
+                    self.waiting_for_removal = true;
+                    self.pending = self.removals.pop_front().unwrap_or_default();
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    fn interrupt(&mut self, timeout: Duration) -> Result<Option<u16>> {
+        if let Some(event) = self.inner.events.pop_front() {
+            return Ok(Some(event));
+        }
+        // Phase-boundary draining sees only already queued model events. Scripted
+        // events arrive after the new detection/removal mode command.
+        if timeout.is_zero() {
+            return Ok(None);
+        }
+        if self.waiting_for_removal {
+            self.removal_polls += 1;
+            if self
+                .cancel_after_removal_polls
+                .is_some_and(|limit| self.removal_polls >= limit)
+            {
+                self.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        let next = self.pending.pop_front().flatten();
+        if next.is_none() {
+            std::thread::sleep(self.idle_delay);
+        }
+        Ok(next)
+    }
+    fn start_image(&mut self) -> Result<()> {
+        self.inner.start_image()
+    }
+    fn image(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
+        std::thread::sleep(self.image_delay);
+        let image = self.inner.image(timeout)?;
+        if self.stale_absence_after_image {
+            self.inner.events.push_back(0x0200);
+        }
+        Ok(image)
+    }
+    fn cancel(&mut self) {
+        self.inner.cancel();
+    }
+}
+
+#[test]
+fn continuous_capture_requires_removal_before_a_second_image() {
+    use std::ops::ControlFlow;
+    use uareu4500::protocol::capture_continuous;
+    let cancel = AtomicBool::new(false);
+    let mut sensor = ContinuousSensor::new(&cancel);
+    let mut events = Vec::new();
+    let mut count = 0;
+    capture_continuous(
+        &mut sensor,
+        options(),
+        &cancel,
+        |event| events.push(event),
+        |image| {
+            assert_eq!(
+                image.pixels.as_slice(),
+                include_bytes!("../fixtures/synthetic-plain.gray")
+            );
+            count += 1;
+            Ok(if count == 2 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            })
+        },
+    )
+    .unwrap();
+    assert_eq!(count, 2);
+    assert!(sensor.removal_polls >= 3);
+    assert_eq!(
+        events,
+        [
+            CaptureEvent::Initializing,
+            CaptureEvent::WaitingForFinger,
+            CaptureEvent::Capturing,
+            CaptureEvent::WaitingForFingerRemoval,
+            CaptureEvent::WaitingForFinger,
+            CaptureEvent::Capturing
+        ]
+    );
+    assert_eq!(
+        sensor
+            .inner
+            .operations
+            .iter()
+            .filter(|op| **op == Operation::Read(0xf0, 16))
+            .count(),
+        1
+    );
+    assert!(sensor.inner.stopped());
+}
+
+#[test]
+fn continuous_capture_held_finger_never_repeats_and_cancellation_cleans_up() {
+    use std::ops::ControlFlow;
+    use uareu4500::protocol::capture_continuous;
+    let cancel = AtomicBool::new(false);
+    let mut sensor = ContinuousSensor::new(&cancel);
+    sensor.removals = [vec![Some(0x0101); 10].into()].into();
+    sensor.cancel_after_removal_polls = Some(5);
+    let mut count = 0;
+    let outcome = capture_continuous(
+        &mut sensor,
+        options(),
+        &cancel,
+        |_| {},
+        |_| {
+            count += 1;
+            Ok(ControlFlow::Continue(()))
+        },
+    );
+    assert!(
+        outcome.is_ok(),
+        "Ctrl-C is a graceful continuous-mode stop: {outcome:?}"
+    );
+    assert_eq!(count, 1);
+    assert!(sensor.inner.stopped());
+}
+
+#[test]
+fn continuous_capture_idle_waits_do_not_consume_next_image_deadline() {
+    use std::ops::ControlFlow;
+    use uareu4500::protocol::capture_continuous;
+    let cancel = AtomicBool::new(false);
+    let mut sensor = ContinuousSensor::new(&cancel);
+    let mut delayed = vec![None; 12];
+    delayed.push(Some(0x0101));
+    sensor.placements = [delayed.into()].into();
+    sensor.idle_delay = Duration::from_millis(10);
+    let mut options = options();
+    options.timeout = Duration::from_millis(100);
+    let mut count = 0;
+    capture_continuous(
+        &mut sensor,
+        options,
+        &cancel,
+        |_| {},
+        |_| {
+            count += 1;
+            Ok(ControlFlow::Break(()))
+        },
+    )
+    .unwrap();
+    assert_eq!(count, 1);
+    assert!(sensor.inner.stopped());
+}
+
+#[test]
+fn continuous_capture_callback_error_stops_and_releases_reader() {
+    use uareu4500::protocol::capture_continuous;
+    let cancel = AtomicBool::new(false);
+    let mut sensor = ContinuousSensor::new(&cancel);
+    let error = capture_continuous(
+        &mut sensor,
+        options(),
+        &cancel,
+        |_| {},
+        |_| anyhow::bail!("disk full"),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "disk full");
+    assert!(sensor.inner.stopped());
+}
+
+#[test]
+fn continuous_capture_still_bounds_image_acquisition() {
+    use std::ops::ControlFlow;
+    use uareu4500::protocol::capture_continuous;
+    let cancel = AtomicBool::new(false);
+    let mut sensor = ContinuousSensor::new(&cancel);
+    sensor.image_delay = Duration::from_millis(110);
+    let mut options = options();
+    options.timeout = Duration::from_millis(100);
+    let error = capture_continuous(
+        &mut sensor,
+        options,
+        &cancel,
+        |_| {},
+        |_| Ok(ControlFlow::Continue(())),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("deadline"));
+    assert!(sensor.inner.stopped());
+}
+
+#[test]
+fn continuous_capture_cancellation_after_image_does_not_arm_another_scan() {
+    use std::ops::ControlFlow;
+    use uareu4500::protocol::capture_continuous;
+    let cancel = AtomicBool::new(false);
+    let mut sensor = ContinuousSensor::new(&cancel);
+    capture_continuous(
+        &mut sensor,
+        options(),
+        &cancel,
+        |_| {},
+        |_| {
+            cancel.store(true, Ordering::Relaxed);
+            Ok(ControlFlow::Continue(()))
+        },
+    )
+    .unwrap();
+    assert!(
+        !sensor
+            .inner
+            .operations
+            .contains(&Operation::Write(0x4e, vec![0x12]))
+    );
+    assert!(sensor.inner.stopped());
+}
+
+#[test]
+fn continuous_capture_keeps_callback_errors_even_if_cancelled_concurrently() {
+    use uareu4500::protocol::capture_continuous;
+    let cancel = AtomicBool::new(false);
+    let mut sensor = ContinuousSensor::new(&cancel);
+    let error = capture_continuous(
+        &mut sensor,
+        options(),
+        &cancel,
+        |_| {},
+        |_| {
+            cancel.store(true, Ordering::Relaxed);
+            Err(std::io::Error::other("disk write failed").into())
+        },
+    )
+    .unwrap_err();
+    assert!(error.is::<std::io::Error>());
+    assert_eq!(error.to_string(), "disk write failed");
+    assert!(sensor.inner.stopped());
+}
+
+#[test]
+fn continuous_capture_removal_wait_does_not_expire() {
+    use std::ops::ControlFlow;
+    use uareu4500::protocol::capture_continuous;
+    let cancel = AtomicBool::new(false);
+    let mut sensor = ContinuousSensor::new(&cancel);
+    let mut delayed = vec![None; 12];
+    delayed.push(Some(0x0200));
+    sensor.removals = [delayed.into()].into();
+    sensor.idle_delay = Duration::from_millis(10);
+    let mut options = options();
+    options.timeout = Duration::from_millis(100);
+    let mut count = 0;
+    capture_continuous(
+        &mut sensor,
+        options,
+        &cancel,
+        |_| {},
+        |_| {
+            count += 1;
+            Ok(if count == 2 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            })
+        },
+    )
+    .unwrap();
+    assert_eq!(count, 2);
+    assert!(sensor.inner.stopped());
+}
+
+#[test]
+fn continuous_capture_does_not_accept_an_absence_queued_before_removal_mode() {
+    use std::ops::ControlFlow;
+    use uareu4500::protocol::capture_continuous;
+    let cancel = AtomicBool::new(false);
+    let mut sensor = ContinuousSensor::new(&cancel);
+    // A completed capture queues a stale finger-off event. The removal phase
+    // must drain it before arming 0x12, not treat it as a new lift.
+    sensor.stale_absence_after_image = true;
+    sensor.removals = [vec![Some(0x0101); 10].into()].into();
+    sensor.cancel_after_removal_polls = Some(5);
+    let mut count = 0;
+    capture_continuous(
+        &mut sensor,
+        options(),
+        &cancel,
+        |_| {},
+        |_| {
+            count += 1;
+            Ok(ControlFlow::Continue(()))
+        },
+    )
+    .unwrap();
+    assert_eq!(count, 1);
+    assert!(sensor.inner.stopped());
+}
+
+#[test]
+fn continuous_capture_cancelled_preflight_does_not_start_hardware() {
+    use std::ops::ControlFlow;
+    use uareu4500::protocol::capture_continuous;
+    let cancel = AtomicBool::new(true);
+    let mut sensor = ContinuousSensor::new(&cancel);
+    capture_continuous(
+        &mut sensor,
+        options(),
+        &cancel,
+        |_| panic!("no notifications before preflight"),
+        |_| Ok(ControlFlow::Break(())),
+    )
+    .unwrap();
+    assert_eq!(sensor.inner.operations, [Operation::Cancel]);
+}

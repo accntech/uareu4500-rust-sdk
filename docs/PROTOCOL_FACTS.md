@@ -32,7 +32,7 @@ notices remain separate.
 | 07 | Hardware status/power control |
 | 33 | Image key-index and host-seed request, five bytes |
 | 34 | Four-byte little-endian image-key response |
-| 4e | Mode: 10 wait for finger, 20 capture, 70 stop |
+| 4e | Mode: 10 wait for finger, 12 wait for removal, 20 capture, 70 stop |
 | f0 | 16-byte diagnostic data |
 
 Status bit 7 denotes low power. A state with bits 7 and 2 set needs recovery:
@@ -132,3 +132,22 @@ the new detection phase rather than accepting a latched startup event while an
 absence event is still queued. Drain loops must honor cancellation/deadlines and
 have a finite count bound. Software queue boundaries cannot establish perfect
 hardware event correlation; physical-device timing tests remain necessary.
+
+## Continuous capture sessions
+
+Mode `4e=12` requests finger-removal detection; a subsequent `0200` event
+confirms removal. This command/event mapping is recorded by the pinned upstream
+uru4000 reference in NOTICE. Continuous capture keeps the initialized interface
+open: after delivering an image it drains queued events, requests removal mode,
+and requires new absence evidence before arming `4e=10` for another placement.
+A repeated `0101` while a finger remains on the sensor does not permit a second
+image. As with other phase boundaries, software event correlation remains
+limited by device timing.
+
+Continuous placement/removal waits have no inactivity deadline but poll with
+bounded allowances and honor cancellation. Initialization and each image
+acquisition receive separate `CaptureOptions::timeout` deadlines. The single-shot
+API retains its overall-session deadline. A delivery callback can request a clean
+stop; cancellation is also a clean stop in continuous mode. Callback, transport,
+frame, and cleanup failures remain errors, and every exit stops/powers down the
+started session and cancels outstanding transfers.

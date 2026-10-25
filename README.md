@@ -22,6 +22,19 @@ cargo build --locked --release
 ./target/release/uareu4500 license
 ```
 
+To keep scanning without restarting the app:
+
+```sh
+./target/release/uareu4500 capture --continuous --output-dir captures
+```
+
+Place your finger to capture, lift it when prompted, then place it again for the
+next image. Holding a finger on the sensor does not create repeated images.
+Each capture receives a unique `fingerprint-<session>-<sequence>.png` filename;
+existing files are never overwritten. The output directory defaults to `captures`.
+Press Ctrl-C to stop and release the reader. Continuous mode requires a directory
+rather than the single-capture `--output` file.
+
 Place a finger after the prompt; Ctrl-C cancels. Output is a new 384 x 290,
 8-bit grayscale PNG with Unix mode `0600`; existing files are not overwritten.
 No biometric data is uploaded. Store and delete images appropriately.
@@ -29,8 +42,11 @@ No biometric data is uploaded. Store and delete images appropriately.
 `list --all` helps diagnose unexpected USB IDs. With multiple readers, specify
 `capture --device INDEX`; indices can change after reconnection. `--no-rotate`
 disables the default 180-degree rotation; polarity is normalized either way.
-The deadline covers the capture session, not OS open/configure/close operations.
-Cleanup has an additional bounded allowance. Open a fresh reader for each capture.
+For a single capture, the deadline covers the capture session, not OS
+open/configure/close operations. In continuous mode, `--timeout` bounds startup
+and each image acquisition; waiting for finger placement or removal can remain
+idle until Ctrl-C. Cleanup has an additional bounded allowance. Single captures
+consume the reader; continuous mode keeps one reader open for the scan sequence.
 
 On Linux, install the reader-scoped active-session rule, then reconnect:
 
@@ -68,6 +84,12 @@ offline wire-frame analysis. The format and inferred behavior are documented in
 [the protocol specification](docs/PROTOCOL_FACTS.md). Legacy scrambling is not a
 modern secure transport guarantee. Hardware acceptance must cover repeated
 capture, cancellation, unplug/reconnect, image orientation, and timing.
+
+For streaming from a library application, use `Reader::capture_continuous` with
+an image callback returning `anyhow::Result<std::ops::ControlFlow<()>>`. Return
+`Continue(())` for another scan or `Break(())` to finish. The SDK waits for actual
+finger removal between scans. Callback errors stop the session and propagate to
+the caller after cleanup; cancellation stops continuous scanning gracefully.
 
 ## Tests and fixtures
 
