@@ -1,7 +1,9 @@
 # UareU Rust SDK
 
-The crate/import name and CLI are now `uareu`. Update application imports and
-build commands when migrating; Rust capture function signatures are unchanged.
+The crate/import name is `uareu`, the CLI is `uareu`, and the Windows library
+and C header are `uareu.dll` and `include/uareu.h`. Update application imports,
+native library paths, and build commands when migrating from the former name.
+Capture function signatures and the `uareu_*` C symbols are unchanged.
 
 Experimental Rust library and command-line tool for U.are.U 4500 USB image
 capture on Windows, Linux, and macOS. Licensed **GPL-3.0-or-later**; see [LICENSE](LICENSE)
@@ -90,6 +92,84 @@ out a connected reader whose Windows driver is missing or incompatible.
 
 See Microsoft's [WinUSB installation documentation](https://learn.microsoft.com/en-us/windows-hardware/drivers/usbcon/winusb-installation)
 and [Code 28 explanation](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/cm-prob-failed-install).
+
+### Windows DLL and C/C# SDK
+
+Build on x64 Windows with Rust's `x86_64-pc-windows-msvc` toolchain and Visual
+Studio C++ build tools:
+
+```powershell
+cargo build --locked --release
+```
+
+This produces `target/release/uareu.dll` and the MSVC import library
+`target/release/uareu.dll.lib`, alongside the CLI and Rust library. Existing
+Rust capture APIs retain their signatures. The DLL requires WinUSB setup above
+and the x64 Microsoft Visual C++ runtime (`VCRUNTIME140.dll`); copying the DLL
+does not install these prerequisites. No DigitalPersona runtime is loaded.
+
+The ABI v1 contract is in [include/uareu.h](include/uareu.h). It exposes
+reader discovery, open/close, blocking capture, cancellation, raw grayscale
+pixels, metadata with resolution provenance, image diagnostics, and PNG
+save/load. Handles are opaque 64-bit IDs. Callers allocate buffers, probe for
+their required size, and release each handle with its matching function.
+Errors are thread-local: retrieve the text on the thread that made the failed
+call. Run capture on a worker thread and cancel from another thread. Close
+requests cancellation; wait for capture cleanup before unloading the DLL.
+Only one capture may run per reader handle. Between captures the USB interface
+is released and reopened, so the handle does not guarantee continuous exclusive
+ownership. See the header for exact lifetimes, timeout semantics, and statuses.
+`uareu_capture_with_callback` optionally reports the same initialization,
+finger placement, removal, and acquisition phases as the CLI. Callbacks run
+synchronously on the capture thread and must not throw across the C boundary.
+The C# example prompts for finger placement from the actual waiting phase,
+then asks the user to hold still until the save completes. The original
+`uareu_capture` entry point remains available and uses identical processing.
+
+The [C# example](examples/csharp/UareuExample.csproj) requires the .NET 10 SDK:
+
+```powershell
+dotnet build examples/csharp/UareuExample.csproj -c Release
+$env:UAREU_DLL_PATH = (Resolve-Path target/release/uareu.dll).Path
+dotnet examples/csharp/bin/Release/net10.0/UareuExample.dll --list
+dotnet examples/csharp/bin/Release/net10.0/UareuExample.dll --capture fingerprint.png
+dotnet examples/csharp/bin/Release/net10.0/UareuExample.dll --inspect fingerprint.png
+```
+
+Place a finger after the capture prompt; Ctrl-C cancels. Save refuses to
+overwrite existing files. Inspection prints dimensions, metadata, and image
+diagnostics. Capture resolution remains **unknown** until verified; the DLL
+does not assign a nominal reader DPI or invoke NFIQ 2. Its quality report marks
+biometric scoring `not_evaluated`. The existing Rust/CLI optional NFIQ 2 path
+remains available under its resolution requirements.
+
+The supplied U.are.U Linux SDK 3.0.0 `dpfpdd.h` was used as a lifecycle reference:
+`dpfpdd_query_devices`, `dpfpdd_open`/`close`, `dpfpdd_capture`, and
+`dpfpdd_cancel` correspond to the discovery, reader, capture, and cancellation
+operations above. This SDK defines its own ABI, handles, statuses, and reports;
+it does not implement the vendor binary interface, enrollment/matching,
+vendor quality flags, image correction, or verified image resolution. Vendor
+headers and binaries are not copied into this project.
+
+To build and verify the DLL from native C and C#, including a synthetic image
+round trip and buffer/handle checks:
+
+```powershell
+./scripts/test-windows-dll.ps1
+# With a connected reader and no finger on the sensor:
+./scripts/test-windows-dll.ps1 -HardwareCancellation
+```
+
+The Windows CI job runs the hardware-independent checks. Hardware cancellation
+is an explicit local check; a reader is not required for CI.
+
+The CLI and DLL share `Reader::capture_with_metadata`, protocol acquisition,
+frame decoding, inversion, rotation, and PNG serialization. Neither applies
+automatic contrast or vendor image correction. A pale image alone does not
+identify an ABI or decoder fault. For a comparison, use a fresh finger placement
+for each scan, wait for the placement prompt, and hold the finger flat and still
+until saved. `tests/ffi_parity.rs` checks pixel/PNG/metadata/diagnostics parity
+using identical plaintext, scrambled, and low-contrast synthetic inputs.
 
 ### Linux and macOS USB setup
 

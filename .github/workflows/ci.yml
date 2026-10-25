@@ -20,3 +20,11 @@ jobs:
       - run: cargo test --locked --workspace --all-targets
       - run: cargo test --locked --workspace --doc
       - run: cargo build --locked --release
+      - uses: actions/setup-dotnet@v4
+        if: runner.os == 'Windows'
+        with:
+          dotnet-version: '10.0.x'
+      - name: Verify Windows DLL from C and C#
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-windows-dll.ps1

@@ -67,7 +67,10 @@ fn project_paths(root: &Path, vendor: bool) -> Result<BTreeMap<String, PathBuf>>
     }
     for (group, extensions) in [
         ("src", &["rs"][..]),
-        ("tests", &["rs"][..]),
+        ("include", &["h"][..]),
+        ("examples", &["c", "cs", "csproj"][..]),
+        ("tests", &["rs", "c"][..]),
+        ("scripts", &["ps1"][..]),
         ("xtask/src", &["rs"][..]),
         ("fixtures", &["wire", "gray"][..]),
         ("udev", &["rules"][..]),
@@ -80,6 +83,9 @@ fn project_paths(root: &Path, vendor: bool) -> Result<BTreeMap<String, PathBuf>>
         }
         for path in walk_files(&directory)? {
             let name = relative(&path, root)?;
+            if group == "examples" && name.split('/').any(|part| ["bin", "obj"].contains(&part)) {
+                continue;
+            }
             if name
                 .split('/')
                 .any(|part| [".git", ".agents", "target", "dist", "__pycache__"].contains(&part))
@@ -865,6 +871,8 @@ mod tests {
             "private.md",
             "tools/package_release.py",
             "tests/test_package_release.py",
+            "examples/csharp/obj/Generated.cs",
+            "examples/csharp/bin/Generated.cs",
             "captures/private.gray",
             "docs/VALIDATION.md",
             "target/debug/private",
@@ -873,8 +881,26 @@ mod tests {
         ] {
             write(&f.root, name, "must not ship");
         }
+        let sdk_sources = [
+            "include/uareu.h",
+            "examples/csharp/Native.cs",
+            "examples/csharp/UareuExample.csproj",
+            "tests/c/abi_smoke.c",
+            "scripts/test-windows-dll.ps1",
+        ];
+        for name in sdk_sources {
+            write(&f.root, name, "SDK source");
+        }
         let snapshot = f.temp.path().join("snapshot");
         snapshot_project(&f.root, &snapshot).unwrap();
+        for name in sdk_sources {
+            assert_eq!(
+                fs::read_to_string(snapshot.join(name)).unwrap(),
+                "SDK source"
+            );
+        }
+        assert!(!snapshot.join("examples/csharp/obj").exists());
+        assert!(!snapshot.join("examples/csharp/bin").exists());
         for name in [
             ".env",
             "private.md",

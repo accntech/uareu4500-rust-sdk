@@ -5,6 +5,8 @@
 .DS_Store
 
 /dist/
+/examples/csharp/bin/
+/examples/csharp/obj/
 
 # Keep the workspace command alias despite global Cargo ignores.
 !/.cargo/
