@@ -217,7 +217,7 @@ fn main() -> anyhow::Result<()> {
 
 `protocol::Transport` supports simulated USB tests. `frame::decode_frame` supports
 offline wire-frame analysis. The format and inferred behavior are documented in
-[the protocol specification](docs/PROTOCOL_FACTS.md). Legacy scrambling is not a
+[the protocol specification](fixtures/docs/PROTOCOL_FACTS.md). Legacy scrambling is not a
 modern secure transport guarantee. Hardware acceptance must cover repeated
 capture, cancellation, unplug/reconnect, image orientation, and timing.
 

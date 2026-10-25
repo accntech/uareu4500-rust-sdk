@@ -53,7 +53,7 @@ fn project_paths(root: &Path, vendor: bool) -> Result<BTreeMap<String, PathBuf>>
         ".gitignore",
         ".gitattributes",
         "REBUILD.sh",
-        "docs/PROTOCOL_FACTS.md",
+        "fixtures/docs/PROTOCOL_FACTS.md",
         ".cargo/config.toml",
         "xtask/Cargo.toml",
     ] {
