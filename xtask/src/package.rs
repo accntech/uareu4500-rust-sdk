@@ -48,6 +48,7 @@ fn project_paths(root: &Path, vendor: bool) -> Result<BTreeMap<String, PathBuf>>
         "LICENSE",
         "NOTICE",
         "README.md",
+        "docs/IMPLEMENTATION_GAPS.md",
         "build.rs",
         "rust-toolchain.toml",
         ".gitignore",
@@ -56,6 +57,9 @@ fn project_paths(root: &Path, vendor: bool) -> Result<BTreeMap<String, PathBuf>>
         "fixtures/docs/PROTOCOL_FACTS.md",
         ".cargo/config.toml",
         "xtask/Cargo.toml",
+        "examples/engine/packages.lock.json",
+        "examples/engine/README.md",
+        "examples/engine/THIRD_PARTY_NOTICES.md",
     ] {
         let path = root.join(name);
         if path.symlink_metadata().is_ok() {
@@ -873,6 +877,8 @@ mod tests {
             "tests/test_package_release.py",
             "examples/csharp/obj/Generated.cs",
             "examples/csharp/bin/Generated.cs",
+            "examples/engine/obj/Generated.cs",
+            "examples/engine/bin/Generated.cs",
             "captures/private.gray",
             "docs/VALIDATION.md",
             "target/debug/private",
@@ -887,6 +893,13 @@ mod tests {
             "examples/csharp/UareuExample.csproj",
             "tests/c/abi_smoke.c",
             "scripts/test-windows-dll.ps1",
+            "examples/engine/UareuEngine.csproj",
+            "examples/engine/Program.cs",
+            "examples/engine/packages.lock.json",
+            "examples/engine/README.md",
+            "examples/engine/THIRD_PARTY_NOTICES.md",
+            "examples/engine/ValidationTests.cs",
+            "docs/IMPLEMENTATION_GAPS.md",
         ];
         for name in sdk_sources {
             write(&f.root, name, "SDK source");
@@ -901,6 +914,8 @@ mod tests {
         }
         assert!(!snapshot.join("examples/csharp/obj").exists());
         assert!(!snapshot.join("examples/csharp/bin").exists());
+        assert!(!snapshot.join("examples/engine/obj").exists());
+        assert!(!snapshot.join("examples/engine/bin").exists());
         for name in [
             ".env",
             "private.md",

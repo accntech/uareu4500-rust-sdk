@@ -12,7 +12,7 @@ and [NOTICE](NOTICE) for the grant, attribution, and upstream license origin.
 Targets USB **05ba:000a**, shared by 4000B/4500 readers. Device behavior and timing
 still require physical-reader verification on each OS. Tests use deterministic,
 non-biometric patterns; they are not hardware acceptance evidence. This tool
-captures images, not enrollment templates, matches, or liveness assessments.
+captures images and provides optional local SourceAFIS recognition. Liveness assessment is unavailable.
 
 ## Build and use
 
@@ -116,9 +116,9 @@ their required size, and release each handle with its matching function.
 Errors are thread-local: retrieve the text on the thread that made the failed
 call. Run capture on a worker thread and cancel from another thread. Close
 requests cancellation; wait for capture cleanup before unloading the DLL.
-Only one capture may run per reader handle. Between captures the USB interface
+Only one capture may run per reader handle. By default, between captures the USB interface
 is released and reopened, so the handle does not guarantee continuous exclusive
-ownership. See the header for exact lifetimes, timeout semantics, and statuses.
+ownership. Opt into persistent ownership with `uareu_reader_open_ex` and `UAREU_OPEN_PERSISTENT`. See the header for exact lifetimes, timeout semantics, and statuses.
 `uareu_capture_with_callback` optionally reports the same initialization,
 finger placement, removal, and acquisition phases as the CLI. Callbacks run
 synchronously on the capture thread and must not throw across the C boundary.
@@ -132,6 +132,7 @@ The [C# example](examples/csharp/UareuExample.csproj) requires the .NET 10 SDK:
 dotnet build examples/csharp/UareuExample.csproj -c Release
 $env:UAREU_DLL_PATH = (Resolve-Path target/release/uareu.dll).Path
 dotnet examples/csharp/bin/Release/net10.0/UareuExample.dll --list
+dotnet examples/csharp/bin/Release/net10.0/UareuExample.dll --status
 dotnet examples/csharp/bin/Release/net10.0/UareuExample.dll --capture fingerprint.png
 dotnet examples/csharp/bin/Release/net10.0/UareuExample.dll --inspect fingerprint.png
 ```
@@ -139,15 +140,15 @@ dotnet examples/csharp/bin/Release/net10.0/UareuExample.dll --inspect fingerprin
 Place a finger after the capture prompt; Ctrl-C cancels. Save refuses to
 overwrite existing files. Inspection prints dimensions, metadata, and image
 diagnostics. Capture resolution remains **unknown** until verified; the DLL
-does not assign a nominal reader DPI or invoke NFIQ 2. Its quality report marks
+does not assign a nominal reader DPI. Its default quality report marks
 biometric scoring `not_evaluated`. The existing Rust/CLI optional NFIQ 2 path
-remains available under its resolution requirements.
+remains available under its resolution requirements; `uareu_image_assess` also exposes it through the DLL.
 
 The supplied U.are.U Linux SDK 3.0.0 `dpfpdd.h` was used as a lifecycle reference:
 `dpfpdd_query_devices`, `dpfpdd_open`/`close`, `dpfpdd_capture`, and
 `dpfpdd_cancel` correspond to the discovery, reader, capture, and cancellation
 operations above. This SDK defines its own ABI, handles, statuses, and reports;
-it does not implement the vendor binary interface, enrollment/matching,
+it does not implement the vendor binary interface, vendor recognition algorithms,
 vendor quality flags, image correction, or verified image resolution. Vendor
 headers and binaries are not copied into this project.
 
@@ -170,6 +171,85 @@ identify an ABI or decoder fault. For a comparison, use a fresh finger placement
 for each scan, wait for the placement prompt, and hold the finger flat and still
 until saved. `tests/ffi_parity.rs` checks pixel/PNG/metadata/diagnostics parity
 using identical plaintext, scrambled, and low-contrast synthetic inputs.
+
+### Reader capabilities, status, and capture errors
+
+`Reader::capabilities()` and `reader::ReaderCapabilities::for_usb_id` describe
+the implemented SDK profile. The JSON separates `sdk` booleans from `device`
+capabilities. SDK capture and asynchronous jobs are implemented; neither statement is a hardware capability query. Device capture,
+streaming, calibration, PIV, liveness, LEDs, onboard processing/storage, power
+management, and supported resolutions remain unknown (`"unknown"` or `null`).
+No resolution is inferred from USB identity or a successful capture.
+
+`Reader::status()` returns a cached lifecycle snapshot. Clone
+`Reader::status_monitor()` before capture consumes the reader, then call
+`ReaderMonitor::snapshot()` from callbacks or another thread. Status includes
+the operation, active capture, interface ownership, a local observation
+sequence, and last operation outcome. `idle` means no capture is active; it
+does not assert physical readiness or connectivity. `finger_present` is a
+cached `true` observation during acquisition and returns to unknown after the
+operation; waiting for a finger does not prove absence. Hardware readiness,
+connectivity, and calibration requirements remain unknown. Queries perform
+no USB I/O and therefore do not detect unplugging on their own.
+
+The C API adds `uareu_reader_list_get_capabilities_json` (without opening the
+device), `uareu_reader_get_capabilities_json`, and
+`uareu_reader_get_status_json`. Status additionally reports the DLL capture
+lease as `busy` and whether cancellation has been requested. JSON snapshots
+may change between size probing and copying: retry `BUFFER_TOO_SMALL`, and
+use the actual returned size when the result shrinks. The C# buffer helper
+handles both cases. Closed, stale, or wrong-kind handles are rejected.
+
+Rust capture/open signatures still return `anyhow::Result`. Failures now carry
+`error::CaptureError` with a machine-readable `kind` and `stage`, while backend
+errors retain their original downcast types. Categories include timeout,
+cancellation, disconnection, permission denied, busy, unsupported operation,
+invalid frame/response, device failure, and transport failure. A failure from
+I/O takes precedence over a concurrent cancellation request. Unclassified
+custom transport errors remain transport failures; their text is never parsed.
+Backend-cancelled transfers are ambiguous (they can also mean backend timeout)
+and remain transport failures unless the protocol observed its own deadline
+or cancellation. Stages identify open, initialization, finger wait, acquisition,
+decode, and cleanup. Cleanup failure is the primary error only when the capture
+itself succeeded; otherwise the original capture failure is preserved with secondary cleanup details.
+
+```rust,no_run
+use std::sync::atomic::AtomicBool;
+use uareu::{error::CaptureError, protocol::CaptureOptions, usb::Reader};
+
+fn capture_with_status(reader: Reader) -> anyhow::Result<()> {
+    let monitor = reader.status_monitor();
+    let result = reader.capture_with_metadata(
+        CaptureOptions::default(), &AtomicBool::new(false),
+        |_| println!("{:?}", monitor.snapshot().operation),
+    );
+    if let Err(error) = &result {
+        if let Some(capture) = error.downcast_ref::<CaptureError>() {
+            eprintln!("{:?} at {:?}: {error:#}", capture.kind, capture.stage);
+        }
+    }
+    println!("{:?}", monitor.snapshot().last_outcome);
+    result.map(|_| ())
+}
+```
+
+The ABI remains version 1 with all previous numeric status codes unchanged.
+Timeout/disconnection/USB failures still return `UAREU_DEVICE_ERROR`; call
+`uareu_last_error_json` on the failing thread for
+`{schema_version,status,kind,stage,message}`. Cancellation still returns
+`UAREU_CANCELLED`. Both error getters preserve the error during probes/copies;
+ordinary successful APIs clear it. The C# example deserializes an `ErrorReport`
+on the worker thread and carries that report in `NativeException` rather than
+parsing exception text. Capture success is not a biometric quality judgment.
+Existing Rust continuous capture retains graceful `Ok(())` on cancellation. The detailed continuous API and monitor distinguish cancellation from a callback stop; the new C continuous API returns `UAREU_CANCELLED`.
+
+Without hardware, `--self-test` checks growing/shrinking snapshot buffers and
+structured errors. With a connected reader, `--status` checks fresh unknown hardware state.
+`--timeout-test` deliberately expires a deadline at a callback boundary before
+protocol writes, `--phase-test` checks status reentrantly from native phase
+callbacks and cancels when waiting for a finger, and `--cancel-test` checks
+the original cancellation entry point. The script's `-HardwareCancellation`
+option runs all four checks without needing a finger.
 
 ### Linux and macOS USB setup
 
@@ -407,3 +487,27 @@ retain their own grants. Their source and notices are included in release packag
 GPL permits commercial use, but distributing applications that incorporate this
 library entails GPL obligations for the combined covered work. The full grant,
 upstream conversion scope, changes, and prior-license limitations are in NOTICE.
+
+## Extended SDK and remaining gaps
+
+The SDK now includes retained reader sessions, repeated capture, owned asynchronous
+capture jobs, explicit register probing, and soft interface recovery. It also offers
+advisory image feedback, opt-in contrast enhancement, cached optional NFIQ 2 reports,
+and an optional local SourceAFIS helper for extraction, comparison, identification,
+and multi-template enrollment. Existing capture entry points remain available.
+
+Supported interchange is deliberately bounded: single-view ISO 19794-2:2005 and
+ANSI 378:2004 minutiae records, and single-view raw 8-bit ISO 19794-4:2005 image
+records. WSQ uses separately supplied NBIS executables; its actual codec round trip
+has not been verified here. These features do not establish standards certification
+or matching accuracy. Recognition and export require declared or verified scale;
+this reader's captured output DPI remains unknown.
+
+See [advanced SDK usage and gap matrix](examples/engine/README.md) for build commands,
+ownership rules, format limits, tests, and unavailable vendor features. Device
+readiness, calibration, liveness, PIV, image correction, additional reader models,
+and authoritative resolution cannot be inferred from successful USB capture.
+
+The [latest implementation gap review](docs/IMPLEMENTATION_GAPS.md) maps remaining
+functionality to the supplied vendor headers and lists the outstanding validation
+work and recommended next steps.
