@@ -37,6 +37,19 @@ int main(int argc, char **argv) {
     REQUIRE(uareu_abi_version() == UAREU_ABI_VERSION);
     REQUIRE(uareu_capture_with_callback(0, 30000, 1, NULL, NULL, &image) == UAREU_INVALID_HANDLE);
     REQUIRE(image == 0);
+    {
+        uint8_t details[2048];
+        REQUIRE(uareu_last_error_json(NULL, 0, &required) == UAREU_BUFFER_TOO_SMALL);
+        REQUIRE(required <= sizeof(details));
+        check(uareu_last_error_json(details, sizeof(details), &required));
+        REQUIRE(strstr((const char *)details, "\"kind\":\"invalid_handle\"") != NULL);
+        REQUIRE(strstr((const char *)details, "\"status\":2") != NULL);
+        check(uareu_last_error(details, sizeof(details), &required));
+        REQUIRE(strstr((const char *)details, "handle") != NULL);
+        REQUIRE(uareu_reader_get_status_json(0, NULL, 0, &required) == UAREU_INVALID_HANDLE);
+        REQUIRE(uareu_reader_get_capabilities_json(0, NULL, 0, &required) == UAREU_INVALID_HANDLE);
+        REQUIRE(uareu_reader_list_get_capabilities_json(0, 0, NULL, 0, &required) == UAREU_INVALID_HANDLE);
+    }
     /* The caller must supply a fresh test-output path. */
     REQUIRE(fopen_s(&file, argv[1], "wbx") == 0 && file != NULL);
     REQUIRE(fwrite(png, 1, sizeof(png), file) == sizeof(png));
@@ -63,6 +76,14 @@ int main(int argc, char **argv) {
     REQUIRE(uareu_image_free(image) == UAREU_INVALID_HANDLE);
     check(uareu_reader_list_create(&list));
     check(uareu_reader_list_count(list, &count));
+    if (count > 0) {
+        uint8_t capabilities[4096];
+        REQUIRE(uareu_reader_list_get_capabilities_json(list, 0, NULL, 0, &required) == UAREU_BUFFER_TOO_SMALL);
+        REQUIRE(required <= sizeof(capabilities));
+        check(uareu_reader_list_get_capabilities_json(list, 0, capabilities, sizeof(capabilities), &required));
+        REQUIRE(strstr((const char *)capabilities, "\"resolutions_ppi\":null") != NULL);
+        REQUIRE(strstr((const char *)capabilities, "\"calibration\":\"unknown\"") != NULL);
+    }
     check(uareu_reader_list_free(list));
     REQUIRE(uareu_reader_list_count(list, &count) == UAREU_INVALID_HANDLE);
     puts("C ABI smoke test passed: layout, buffers, pixels, metadata, diagnostics, discovery, stale handles.");

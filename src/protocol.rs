@@ -2,6 +2,9 @@
 // Protocol reference: libfprint; Copyright (C) 2007-2008 Daniel Drake,
 // Copyright (C) 2012 Timo Teräs. See NOTICE for license origin and scope.
 // Rust implementation and modifications: 2026-10-25, UareU Rust SDK contributors.
+use crate::error::{
+    CaptureError, CaptureErrorKind as Kind, CaptureStage as Stage, transport_error,
+};
 use crate::frame::Image;
 use crate::metadata::CapturedImage;
 use std::{sync::atomic::AtomicBool, time::Duration};
@@ -45,15 +48,11 @@ pub enum CaptureEvent {
     WaitingForFingerRemoval,
     Capturing,
 }
-#[derive(Debug)]
-struct CaptureCancelled;
-impl std::fmt::Display for CaptureCancelled {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("capture cancelled")
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContinuousStop {
+    Callback,
+    Cancelled { stage: Stage },
 }
-impl std::error::Error for CaptureCancelled {}
-
 struct Session<'a, T: Transport> {
     io: &'a mut T,
     cancel: &'a AtomicBool,
@@ -61,17 +60,21 @@ struct Session<'a, T: Transport> {
     active: bool,
     ready: bool,
     finger: bool,
+    stage: Stage,
 }
 impl<T: Transport> Session<'_, T> {
     fn check(&self) -> anyhow::Result<()> {
         if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(CaptureCancelled.into());
+            return Err(CaptureError::new(Kind::Cancelled, self.stage, "capture cancelled").into());
         }
-        anyhow::ensure!(
-            self.deadline
-                .is_none_or(|deadline| std::time::Instant::now() < deadline),
-            "capture deadline exceeded"
-        );
+        if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(
+                CaptureError::new(Kind::Timeout, self.stage, "capture deadline exceeded").into(),
+            );
+        }
         Ok(())
     }
     fn allowance(&self) -> anyhow::Result<Duration> {
@@ -84,28 +87,47 @@ impl<T: Transport> Session<'_, T> {
     }
     fn read(&mut self, register: u16, length: u16) -> anyhow::Result<Vec<u8>> {
         let timeout = self.allowance()?;
-        let bytes = self.io.read_registers(register, length, timeout)?;
+        let bytes = self
+            .io
+            .read_registers(register, length, timeout)
+            .map_err(|cause| transport_error(self.stage, cause))?;
+        if bytes.len() != usize::from(length) {
+            return Err(CaptureError::new(
+                Kind::InvalidResponse,
+                self.stage,
+                format!("register {register:02x} returned an unexpected length"),
+            )
+            .into());
+        }
         self.check()?;
-        anyhow::ensure!(
-            bytes.len() == usize::from(length),
-            "register {register:02x} returned an unexpected length"
-        );
         Ok(bytes)
     }
     fn write(&mut self, register: u16, bytes: &[u8]) -> anyhow::Result<()> {
         let timeout = self.allowance()?;
-        self.io.write_registers(register, bytes, timeout)?;
+        self.io
+            .write_registers(register, bytes, timeout)
+            .map_err(|cause| transport_error(self.stage, cause))?;
         self.check()
     }
     fn poll(&mut self, wait: Duration) -> anyhow::Result<()> {
         let timeout = self.allowance()?.min(wait);
-        let event = self.io.interrupt(timeout)?;
+        let event = self
+            .io
+            .interrupt(timeout)
+            .map_err(|cause| transport_error(self.stage, cause))?;
+        if event == Some(0x0800) {
+            return Err(CaptureError::new(
+                Kind::DeviceFailure,
+                self.stage,
+                "reader reported scan failure",
+            )
+            .into());
+        }
         self.check()?;
         match event {
             Some(0x56aa) => self.ready = true,
             Some(0x0101) => self.finger = true,
             Some(0x0200) => self.finger = false,
-            Some(0x0800) => anyhow::bail!("reader reported scan failure"),
             _ => {}
         }
         Ok(())
@@ -115,13 +137,21 @@ impl<T: Transport> Session<'_, T> {
         // of software latches. Refuse an endless stream of stale interrupts.
         for _ in 0..64 {
             self.check()?;
-            let event = self.io.interrupt(Duration::ZERO)?;
+            let event = self
+                .io
+                .interrupt(Duration::ZERO)
+                .map_err(|cause| transport_error(self.stage, cause))?;
             self.check()?;
             if event.is_none() {
                 return Ok(());
             }
         }
-        anyhow::bail!("interrupt queue did not empty at phase boundary")
+        Err(CaptureError::new(
+            Kind::InvalidResponse,
+            self.stage,
+            "interrupt queue did not empty at phase boundary",
+        )
+        .into())
     }
     fn pause(&self, duration: Duration) -> anyhow::Result<()> {
         self.check()?;
@@ -154,7 +184,14 @@ impl<T: Transport> Session<'_, T> {
                 }
                 self.pause(Duration::from_millis(5))?;
             }
-            anyhow::ensure!(recovered, "reader recovery did not complete");
+            if !recovered {
+                return Err(CaptureError::new(
+                    Kind::DeviceFailure,
+                    self.stage,
+                    "reader recovery did not complete",
+                )
+                .into());
+            }
         }
         for _ in 0..3 {
             if status & 0x80 == 0 {
@@ -187,9 +224,15 @@ impl<T: Transport> Session<'_, T> {
                 }
             }
         }
-        anyhow::bail!("reader did not become power ready")
+        Err(CaptureError::new(
+            Kind::DeviceFailure,
+            self.stage,
+            "reader did not become power ready",
+        )
+        .into())
     }
     fn initialize(&mut self, callback: &mut impl FnMut(CaptureEvent)) -> anyhow::Result<()> {
+        self.stage = Stage::Initialization;
         self.notify(CaptureEvent::Initializing, callback)?;
         self.active = true;
         self.power_up()?;
@@ -201,6 +244,7 @@ impl<T: Transport> Session<'_, T> {
         present: bool,
         callback: &mut impl FnMut(CaptureEvent),
     ) -> anyhow::Result<()> {
+        self.stage = Stage::FingerWait;
         self.notify(
             if present {
                 CaptureEvent::WaitingForFinger
@@ -225,15 +269,22 @@ impl<T: Transport> Session<'_, T> {
         options: CaptureOptions,
         callback: &mut impl FnMut(CaptureEvent),
     ) -> anyhow::Result<CapturedImage> {
+        self.stage = Stage::Acquisition;
         self.notify(CaptureEvent::Capturing, callback)?;
         for _ in 0..3 {
             self.check()?;
-            self.io.start_image()?;
+            self.stage = Stage::Acquisition;
+            self.io
+                .start_image()
+                .map_err(|cause| transport_error(self.stage, cause))?;
             self.check()?;
             self.write(0x4e, &[0x20])?;
             let bytes = loop {
                 let timeout = self.allowance()?;
-                let image = self.io.image(timeout)?;
+                let image = self
+                    .io
+                    .image(timeout)
+                    .map_err(|cause| transport_error(self.stage, cause))?;
                 self.check()?;
                 if let Some(bytes) = image {
                     break bytes;
@@ -241,11 +292,13 @@ impl<T: Transport> Session<'_, T> {
                 self.poll(Duration::ZERO)?;
                 self.pause(Duration::from_millis(1))?;
             };
+            self.stage = Stage::Decode;
             let decoded =
                 crate::frame::decode_frame_with_metadata(&bytes, options.rotate180, |index| {
                     self.check()?;
                     let mut entropy = [0u8; 4];
-                    getrandom::fill(&mut entropy)?;
+                    getrandom::fill(&mut entropy)
+                        .map_err(|cause| transport_error(self.stage, cause.into()))?;
                     let seed = u32::from_le_bytes(entropy) & 0x7fff_ffff;
                     let mut request = [0u8; 5];
                     request[0] = index;
@@ -265,7 +318,12 @@ impl<T: Transport> Session<'_, T> {
                 Err(error) => return Err(error),
             }
         }
-        anyhow::bail!("reader returned three invalid frames")
+        Err(CaptureError::new(
+            Kind::InvalidFrame,
+            Stage::Decode,
+            "reader returned three invalid frames",
+        )
+        .into())
     }
     fn run(
         &mut self,
@@ -291,7 +349,13 @@ impl<T: Transport> Session<'_, T> {
             self.deadline = Some(
                 std::time::Instant::now()
                     .checked_add(options.timeout)
-                    .ok_or_else(|| anyhow::anyhow!("capture timeout is out of range"))?,
+                    .ok_or_else(|| {
+                        CaptureError::new(
+                            Kind::InvalidArgument,
+                            Stage::Acquisition,
+                            "capture timeout is out of range",
+                        )
+                    })?,
             );
             let captured = self.acquire_image(options, callback)?;
             let action = image(captured)?;
@@ -312,9 +376,11 @@ impl<T: Transport> Session<'_, T> {
                     self.io
                         .write_registers(register, &[value], Duration::from_millis(100))
                 {
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
+                    let error = transport_error(Stage::Cleanup, error);
+                    first_error = Some(match first_error.take() {
+                        None => error,
+                        Some(primary) => crate::error::attach_cleanup(primary, Err(error)),
+                    });
                 }
             }
         }
@@ -345,7 +411,12 @@ pub fn capture_with_metadata(
     let now = std::time::Instant::now();
     let Some(deadline) = now.checked_add(options.timeout) else {
         transport.cancel();
-        anyhow::bail!("capture timeout is out of range");
+        return Err(CaptureError::new(
+            Kind::InvalidArgument,
+            Stage::Initialization,
+            "capture timeout is out of range",
+        )
+        .into());
     };
     let mut session = Session {
         io: transport,
@@ -354,11 +425,12 @@ pub fn capture_with_metadata(
         active: false,
         ready: false,
         finger: false,
+        stage: Stage::Initialization,
     };
     let outcome = session.run(options, &mut event);
     let cleanup = session.cleanup();
     match outcome {
-        Err(error) => Err(error),
+        Err(error) => Err(crate::error::attach_cleanup(error, cleanup)),
         Ok(image) => {
             cleanup?;
             Ok(image)
@@ -385,12 +457,27 @@ pub fn capture_continuous_with_metadata(
     transport: &mut impl Transport,
     options: CaptureOptions,
     cancel: &AtomicBool,
+    event: impl FnMut(CaptureEvent),
+    image: impl FnMut(CapturedImage) -> anyhow::Result<std::ops::ControlFlow<()>>,
+) -> anyhow::Result<()> {
+    capture_continuous_detailed(transport, options, cancel, event, image).map(|_| ())
+}
+/// Like continuous capture, but preserves whether a callback or cancellation stopped it.
+pub fn capture_continuous_detailed(
+    transport: &mut impl Transport,
+    options: CaptureOptions,
+    cancel: &AtomicBool,
     mut event: impl FnMut(CaptureEvent),
     mut image: impl FnMut(CapturedImage) -> anyhow::Result<std::ops::ControlFlow<()>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ContinuousStop> {
     let Some(deadline) = std::time::Instant::now().checked_add(options.timeout) else {
         transport.cancel();
-        anyhow::bail!("capture timeout is out of range");
+        return Err(CaptureError::new(
+            Kind::InvalidArgument,
+            Stage::Initialization,
+            "capture timeout is out of range",
+        )
+        .into());
     };
     let mut session = Session {
         io: transport,
@@ -399,12 +486,22 @@ pub fn capture_continuous_with_metadata(
         active: false,
         ready: false,
         finger: false,
+        stage: Stage::Initialization,
     };
     let outcome = session.run_continuous(options, &mut event, &mut image);
     let cleanup = session.cleanup();
     match outcome {
-        Err(error) if !error.is::<CaptureCancelled>() => Err(error),
-        _ => cleanup,
+        Err(error) => match error.downcast_ref::<CaptureError>() {
+            Some(error) if error.kind == Kind::Cancelled => {
+                cleanup?;
+                Ok(ContinuousStop::Cancelled { stage: error.stage })
+            }
+            _ => Err(crate::error::attach_cleanup(error, cleanup)),
+        },
+        Ok(()) => {
+            cleanup?;
+            Ok(ContinuousStop::Callback)
+        }
     }
 }
 
@@ -423,9 +520,26 @@ mod tests {
         invalid_frames: bool,
         key_failure: bool,
         image_calls: usize,
+        read_failure: Option<nusb::transfer::TransferError>,
+        cancel_on_failure: Option<std::sync::Arc<AtomicBool>>,
+        no_finger: bool,
+        short_read: bool,
+        scan_failure: bool,
     }
     impl Transport for Fake {
         fn read_registers(&mut self, r: u16, n: u16, _: Duration) -> anyhow::Result<Vec<u8>> {
+            if self.short_read {
+                if let Some(cancel) = &self.cancel_on_failure {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                return Ok(vec![]);
+            }
+            if let Some(error) = self.read_failure.take() {
+                if let Some(cancel) = &self.cancel_on_failure {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                return Err(error.into());
+            }
             if r == 0x34 && self.key_failure {
                 return Err(std::io::Error::other("injected key failure").into());
             }
@@ -440,8 +554,9 @@ mod tests {
             if r == 7 && b.len() == 1 && b[0] & 0x80 == 0 {
                 self.events.push_back(0x56aa);
             }
-            if r == 0x4e && b == [0x10] {
-                self.events.push_back(0x0101);
+            if r == 0x4e && b == [0x10] && !self.no_finger {
+                self.events
+                    .push_back(if self.scan_failure { 0x0800 } else { 0x0101 });
             }
             if self.fail_stop && r == 0x4e && b == [0x70] {
                 anyhow::bail!("stop failed")
@@ -449,7 +564,13 @@ mod tests {
             Ok(())
         }
         fn interrupt(&mut self, _: Duration) -> anyhow::Result<Option<u16>> {
-            Ok(self.events.pop_front())
+            let event = self.events.pop_front();
+            if event == Some(0x0800) {
+                if let Some(cancel) = &self.cancel_on_failure {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            Ok(event)
         }
         fn start_image(&mut self) -> anyhow::Result<()> {
             self.started = true;
@@ -478,6 +599,127 @@ mod tests {
         fn cancel(&mut self) {
             self.cancelled += 1;
         }
+    }
+    #[test]
+    fn observed_protocol_failures_are_not_relabelled_by_concurrent_cancellation() {
+        for short in [false, true] {
+            let cancel = std::sync::Arc::new(AtomicBool::new(false));
+            let mut fake = Fake {
+                short_read: short,
+                scan_failure: !short,
+                cancel_on_failure: Some(cancel.clone()),
+                ..Default::default()
+            };
+            let cause = capture(&mut fake, Default::default(), &cancel, |_| {}).unwrap_err();
+            assert!(cancel.load(Ordering::Relaxed));
+            assert_eq!(
+                cause.downcast_ref::<CaptureError>().unwrap().kind,
+                if short {
+                    Kind::InvalidResponse
+                } else {
+                    Kind::DeviceFailure
+                }
+            );
+        }
+    }
+    #[test]
+    fn structured_causes_survive_cancellation_races_and_cleanup_failures() {
+        for (failure, expected) in [
+            (
+                nusb::transfer::TransferError::Disconnected,
+                Kind::Disconnected,
+            ),
+            (nusb::transfer::TransferError::Cancelled, Kind::Transport),
+            (nusb::transfer::TransferError::Stall, Kind::Transport),
+        ] {
+            let cancel = std::sync::Arc::new(AtomicBool::new(false));
+            let mut fake = Fake {
+                read_failure: Some(failure),
+                cancel_on_failure: Some(cancel.clone()),
+                fail_stop: true,
+                ..Default::default()
+            };
+            let cause = capture(&mut fake, Default::default(), &cancel, |_| {}).unwrap_err();
+            assert!(cancel.load(Ordering::Relaxed));
+            let typed = cause.downcast_ref::<CaptureError>().unwrap();
+            assert_eq!(typed.kind, expected);
+            assert_eq!(typed.stage, Stage::Initialization);
+            assert!(cause.is::<nusb::transfer::TransferError>());
+            let report = crate::error::CaptureFailure::from_error(&cause);
+            assert_eq!(report.kind, expected);
+            assert_eq!(report.cleanup.as_ref().unwrap().stage, Some(Stage::Cleanup));
+            assert_eq!(fake.cancelled, 1);
+        }
+    }
+    #[test]
+    fn structured_timeout_cancel_invalid_frame_and_cleanup_are_distinct() {
+        let mut fake = Fake::default();
+        let cancelled = capture(
+            &mut fake,
+            Default::default(),
+            &AtomicBool::new(true),
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(
+            cancelled.downcast_ref::<CaptureError>().unwrap().kind,
+            Kind::Cancelled
+        );
+        let mut fake = Fake {
+            no_finger: true,
+            ..Default::default()
+        };
+        let mut reached_wait = false;
+        let timed_out = capture(
+            &mut fake,
+            CaptureOptions {
+                timeout: Duration::from_millis(100),
+                ..Default::default()
+            },
+            &AtomicBool::new(false),
+            |phase| reached_wait |= phase == CaptureEvent::WaitingForFinger,
+        )
+        .unwrap_err();
+        let typed = timed_out.downcast_ref::<CaptureError>().unwrap();
+        assert_eq!(typed.kind, Kind::Timeout);
+        assert_eq!(
+            typed.stage,
+            if reached_wait {
+                Stage::FingerWait
+            } else {
+                Stage::Initialization
+            }
+        );
+        let mut fake = Fake {
+            invalid_frames: true,
+            ..Default::default()
+        };
+        let invalid = capture(
+            &mut fake,
+            Default::default(),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(
+            invalid.downcast_ref::<CaptureError>().unwrap().kind,
+            Kind::InvalidFrame
+        );
+        let mut fake = Fake {
+            fail_stop: true,
+            ..Default::default()
+        };
+        let cleanup = capture(
+            &mut fake,
+            Default::default(),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(
+            cleanup.downcast_ref::<CaptureError>().unwrap().stage,
+            Stage::Cleanup
+        );
     }
     #[test]
     fn preflight_always_cancels_without_writes() {

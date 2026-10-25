@@ -56,9 +56,10 @@ typedef struct uareu_image_info {
  * - Releasing an image/list does not interrupt an already-entered read call.
  * - A discovery snapshot stays fixed; indices are meaningful only in that list.
  *   Reader handles survive freeing the list. Re-enumerate after reconnecting.
- * - Open claims the interface but does not capture. Each capture consumes that
- *   USB session and releases the reader on exit. Subsequent captures reopen it;
- *   exclusive ownership is not retained between successive captures.
+ * - Open claims the interface but does not capture. Default captures release
+ *   that USB session on exit and reopen it next time. open_ex with
+ *   UAREU_OPEN_PERSISTENT retains the interface between successful/cancelled
+ *   operations; a detected disconnection discards the session for reopening.
  * - Windows requires WinUSB assigned to USB 05ba:000a. No vendor SDK is required.
  */
 
@@ -73,6 +74,18 @@ UAREU_API uint32_t UAREU_CALL uareu_abi_version(void);
  * uareu_last_error itself never clears/replaces that error, including probes.
  */
 UAREU_API uareu_status UAREU_CALL uareu_last_error(uint8_t *buffer, size_t capacity, size_t *required);
+/* Additive ABI v1 query: UTF-8 JSON {schema_version,status,kind,stage,message}.
+ * Like last_error, this never replaces/clears the failing thread's error.
+ * Existing status values/return conventions are unchanged. In particular,
+ * timeout/disconnect/USB failures still return DEVICE_ERROR; inspect kind.
+ * kind distinguishes timeout, cancelled, disconnected, busy, permission_denied,
+ * invalid_argument, unsupported, invalid_frame, invalid_response, device_failure,
+ * transport and other, plus API errors such as invalid_handle/image_error.
+ * stage is open/initialization/finger_wait/acquisition/decode/cleanup or null.
+ * A backend-cancelled transfer may also be a backend timeout: kind remains
+ * transport unless the protocol itself observed cancellation/deadline expiry.
+ */
+UAREU_API uareu_status UAREU_CALL uareu_last_error_json(uint8_t *buffer, size_t capacity, size_t *required);
 
 UAREU_API uareu_status UAREU_CALL uareu_reader_list_create(uareu_handle *output);
 UAREU_API uareu_status UAREU_CALL uareu_reader_list_count(uareu_handle list, uint32_t *count);
@@ -81,7 +94,38 @@ UAREU_API uareu_status UAREU_CALL uareu_reader_list_count(uareu_handle list, uin
 UAREU_API uareu_status UAREU_CALL uareu_reader_list_get_json(uareu_handle list, uint32_t index, uint8_t *buffer, size_t capacity, size_t *required);
 UAREU_API uareu_status UAREU_CALL uareu_reader_list_free(uareu_handle list);
 UAREU_API uareu_status UAREU_CALL uareu_reader_open(uareu_handle list, uint32_t index, uareu_handle *output);
+/* Explicit opt-in persistent interface ownership. Existing open keeps its
+ * original one-shot interface-release behavior. Close releases the session;
+ * disconnect or transport failure may still make the device unusable. */
+#define UAREU_OPEN_PERSISTENT 1u
+UAREU_API uareu_status UAREU_CALL uareu_reader_open_ex(uareu_handle list, uint32_t index, uint32_t flags, uareu_handle *output);
 UAREU_API uareu_status UAREU_CALL uareu_reader_close(uareu_handle reader);
+/* Capabilities JSON schema 1 separates implemented SDK operations (booleans)
+ * from device capabilities (unknown/supported/unsupported). Device flags and
+ * resolutions remain unknown/null: this SDK has no authoritative hardware
+ * capability query. SDK false means unimplemented, not hardware unsupported.
+ * List query does not open/claim a device; reader query requires a live handle.
+ */
+UAREU_API uareu_status UAREU_CALL uareu_reader_list_get_capabilities_json(uareu_handle list, uint32_t index, uint8_t *buffer, size_t capacity, size_t *required);
+UAREU_API uareu_status UAREU_CALL uareu_reader_get_capabilities_json(uareu_handle reader, uint8_t *buffer, size_t capacity, size_t *required);
+/* Cached SDK lifecycle snapshot, no USB I/O and no physical-state probe.
+ * JSON schema 1: source, sequence, operation, capture_active, interface_claimed,
+ * finger_present, hardware_ready, calibration_required, connected, last_outcome;
+ * DLL additionally exposes busy (capture lease) and cancellation_requested.
+ * sequence is a local observation counter. Hardware readiness, connectivity,
+ * calibration remain null. Finger presence is only a cached true observation
+ * during acquisition; idle/initializing/waiting/finished states return null.
+ * Completed capture does not imply biometric quality. Closed/stale handles fail.
+ * Snapshots can change between buffer probes; retry BUFFER_TOO_SMALL and use
+ * the actual required count after success (the JSON may also shrink).
+ */
+UAREU_API uareu_status UAREU_CALL uareu_reader_get_status_json(uareu_handle reader, uint8_t *buffer, size_t capacity, size_t *required);
+/* Explicit bounded status-register observation: timestamp, raw register and
+ * low-power flag. Readiness/calibration/DPI remain unknown. Requires idle
+ * reader; concurrent capture returns BUSY. Output is an owned data handle. */
+UAREU_API uareu_status UAREU_CALL uareu_reader_probe(uareu_handle reader, uareu_handle *observation);
+/* Stop/low-power/queue rearm only, NOT vendor reset or calibration. */
+UAREU_API uareu_status UAREU_CALL uareu_reader_recover(uareu_handle reader);
 
 /* Blocking single capture, best run on a caller-owned worker thread.
  * timeout_ms: 1..3600000; rotate180: 0 or 1. Output is zero on failure.
@@ -106,6 +150,23 @@ UAREU_API uareu_status UAREU_CALL uareu_capture(uareu_handle reader, uint32_t ti
 typedef void (UAREU_CALL *uareu_capture_callback)(uint32_t phase, void *context);
 UAREU_API uareu_status UAREU_CALL uareu_capture_with_callback(uareu_handle reader, uint32_t timeout_ms, uint32_t rotate180, uareu_capture_callback callback, void *context, uareu_handle *output);
 UAREU_API uareu_status UAREU_CALL uareu_cancel(uareu_handle reader);
+/* Repeated placements, NOT video streaming. Caller owns each image handle
+ * upon callback entry (including stop/error) and must free it exactly once.
+ * Return 0 to continue, 1 to stop. Other values fail INVALID_ARGUMENT.
+ * Phase/image callbacks are synchronous and must not unwind or unload DLL.
+ * Cancellation returns CANCELLED; legacy Rust APIs still stop gracefully OK. */
+typedef uint32_t (UAREU_CALL *uareu_image_callback)(uareu_handle image, void *context);
+UAREU_API uareu_status UAREU_CALL uareu_capture_continuous(uareu_handle reader, uint32_t timeout_ms, uint32_t rotate180, uareu_image_callback image, uareu_capture_callback phase, void *context);
+/* Owned async job: start reserves the reader before returning; worker performs
+ * capture. No foreign callbacks run on the worker. Wait copies errors onto its
+ * calling thread. completed=0 means pending; completed=1 consumes image/error
+ * once. Free cancels AND JOINS worker; free every job before unloading DLL.
+ * Task cancellation and reader cancellation target the same operation. */
+UAREU_API uareu_status UAREU_CALL uareu_capture_start(uareu_handle reader, uint32_t timeout_ms, uint32_t rotate180, uareu_handle *task);
+UAREU_API uareu_status UAREU_CALL uareu_task_wait(uareu_handle task, uint32_t timeout_ms, uareu_handle *image, uint32_t *completed);
+UAREU_API uareu_status UAREU_CALL uareu_task_cancel(uareu_handle task);
+UAREU_API uareu_status UAREU_CALL uareu_task_get_status_json(uareu_handle task, uint8_t *buffer, size_t capacity, size_t *required);
+UAREU_API uareu_status UAREU_CALL uareu_task_free(uareu_handle task);
 
 UAREU_API uareu_status UAREU_CALL uareu_image_get_info(uareu_handle image, uareu_image_info *info, size_t info_size);
 UAREU_API uareu_status UAREU_CALL uareu_image_get_pixels(uareu_handle image, uint8_t *buffer, size_t capacity, size_t *required);
@@ -120,6 +181,9 @@ UAREU_API uareu_status UAREU_CALL uareu_image_get_report_json(uareu_handle image
 UAREU_API uareu_status UAREU_CALL uareu_image_save_png(uareu_handle image, const uint8_t *path, size_t path_length);
 UAREU_API uareu_status UAREU_CALL uareu_image_load_png(const uint8_t *path, size_t path_length, uareu_handle *output);
 UAREU_API uareu_status UAREU_CALL uareu_image_free(uareu_handle image);
+UAREU_API uareu_status UAREU_CALL uareu_data_get_json(uareu_handle data, uint8_t *buffer, size_t capacity, size_t *required);
+UAREU_API uareu_status UAREU_CALL uareu_data_free(uareu_handle data);
+UAREU_API uareu_status UAREU_CALL uareu_data_from_json(const uint8_t *input, size_t length, uareu_handle *data);
 
 #ifdef __cplusplus
 }

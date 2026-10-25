@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::metadata::CapturedImage;
 use crate::{
+    error::{CaptureError, CaptureErrorKind, CaptureStage, transport_error},
+    reader::{ReaderCapabilities, ReaderMonitor, ReaderStatus},
+};
+use crate::{
     frame::{Image, MAX_FRAME_SIZE},
     protocol::{self, CaptureEvent, CaptureOptions, Transport},
 };
@@ -60,15 +64,25 @@ pub fn readers() -> Result<Vec<DeviceInfo>> {
 /// An exclusively opened reader. Drop releases its USB interface.
 pub struct Reader {
     transport: UsbTransport,
+    monitor: ReaderMonitor,
 }
 impl Reader {
     pub fn open(info: &DeviceInfo) -> Result<Self> {
-        ensure!(
-            supported_id(info.vendor_id(), info.product_id()),
-            "unsupported USB ID {:04x}:{:04x}",
-            info.vendor_id(),
-            info.product_id()
-        );
+        Self::open_inner(info).map_err(|cause| transport_error(CaptureStage::Open, cause))
+    }
+    fn open_inner(info: &DeviceInfo) -> Result<Self> {
+        if !supported_id(info.vendor_id(), info.product_id()) {
+            return Err(CaptureError::new(
+                CaptureErrorKind::Unsupported,
+                CaptureStage::Open,
+                format!(
+                    "unsupported USB ID {:04x}:{:04x}",
+                    info.vendor_id(),
+                    info.product_id()
+                ),
+            )
+            .into());
+        }
         let device = info.open().wait().context("cannot open reader; on Linux install the supplied udev rule; on macOS check USB accessory approval")?;
         let (number, alternate) = match device.active_configuration() {
             Ok(config) => capture_interface(config)?,
@@ -103,7 +117,10 @@ impl Reader {
         let image = interface.endpoint::<Bulk, In>(0x82)?;
         // Queue before power-up so that an early 0x56aa IRQ cannot be lost.
         interrupt.submit(Buffer::new(64));
+        let monitor = ReaderMonitor::default();
+        monitor.claimed();
         Ok(Self {
+            monitor,
             transport: UsbTransport {
                 interface,
                 interrupt,
@@ -113,15 +130,101 @@ impl Reader {
         })
     }
 
+    pub fn capabilities(&self) -> ReaderCapabilities {
+        ReaderCapabilities::for_usb_id(0x05ba, 0x000a)
+            .expect("Reader only opens the supported profile")
+    }
+    pub fn status(&self) -> ReaderStatus {
+        self.monitor.snapshot()
+    }
+    pub fn status_monitor(&self) -> ReaderMonitor {
+        self.monitor.clone()
+    }
+    /// Explicit bounded read of documented status register 07, not a capability
+    /// or readiness/calibration query. Returned connectivity is historical.
+    pub fn probe_status(&mut self) -> Result<crate::reader::HardwareObservation> {
+        self.monitor.begin_probe();
+        let result = (|| {
+            let bytes = self
+                .transport
+                .read_registers(7, 1, Duration::from_millis(100))
+                .map_err(|e| transport_error(CaptureStage::Open, e))?;
+            if bytes.len() != 1 {
+                return Err(CaptureError::new(
+                    CaptureErrorKind::InvalidResponse,
+                    CaptureStage::Open,
+                    "short hardware status register",
+                )
+                .into());
+            }
+            Ok(crate::reader::HardwareObservation {
+                source: "usb_register_07",
+                observed_unix_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|d| u64::try_from(d.as_millis()).ok()),
+                connected_at_observation: true,
+                hardware_status_register: bytes[0],
+                low_power: bytes[0] & 0x80 != 0,
+                hardware_ready: None,
+                calibration_required: None,
+            })
+        })();
+        self.monitor.finish_probe(
+            result
+                .as_ref()
+                .cloned()
+                .map_err(crate::error::CaptureFailure::from_error),
+        );
+        result
+    }
+    /// Known stop/low-power sequence and queue rearm; NOT vendor calibration or
+    /// a USB bus reset. Both writes are attempted even if the first fails.
+    pub fn recover_interface(&mut self) -> Result<()> {
+        self.monitor.begin_probe();
+        let first = self
+            .transport
+            .write_registers(0x4e, &[0x70], Duration::from_millis(100));
+        let second = self
+            .transport
+            .write_registers(7, &[0x80], Duration::from_millis(100));
+        self.transport.cancel();
+        let rearm = self.transport.rearm();
+        let mut result = Ok(());
+        for next in [first, second, rearm] {
+            let next = next.map_err(|e| transport_error(CaptureStage::Cleanup, e));
+            result = match result {
+                Ok(()) => next,
+                Err(cause) => Err(crate::error::attach_cleanup(cause, next)),
+            };
+        }
+        let probe = self.probe_status();
+        let result = match result {
+            Ok(()) => probe.map(|_| ()),
+            Err(cause) => Err(crate::error::attach_cleanup(cause, probe.map(|_| ()))),
+        };
+        if let Err(cause) = &result {
+            self.monitor
+                .finish_probe(Err(crate::error::CaptureFailure::from_error(cause)));
+        }
+        result
+    }
+    pub(crate) fn with_monitor(mut self, monitor: ReaderMonitor) -> Self {
+        self.monitor.released();
+        self.monitor = monitor;
+        self.monitor.claimed();
+        self
+    }
+
     /// Wait for a finger, capture one image, and stop the reader.
     /// Open again for another scan; consuming self guarantees interface release.
     pub fn capture(
-        mut self,
+        self,
         options: CaptureOptions,
         cancel: &AtomicBool,
         event: impl FnMut(CaptureEvent),
     ) -> Result<Image> {
-        protocol::capture(&mut self.transport, options, cancel, event)
+        Ok(self.capture_with_metadata(options, cancel, event)?.image)
     }
 
     /// Single capture with processing/coverage metadata and unknown resolution.
@@ -131,7 +234,26 @@ impl Reader {
         cancel: &AtomicBool,
         event: impl FnMut(CaptureEvent),
     ) -> Result<CapturedImage> {
-        protocol::capture_with_metadata(&mut self.transport, options, cancel, event)
+        self.capture_next(options, cancel, event)
+    }
+
+    /// Capture without releasing the claimed interface. Rearms cancelled queues
+    /// after the preceding operation's bounded protocol cleanup.
+    pub fn capture_next(
+        &mut self,
+        options: CaptureOptions,
+        cancel: &AtomicBool,
+        mut event: impl FnMut(CaptureEvent),
+    ) -> Result<CapturedImage> {
+        self.monitor.observe(|| {
+            self.transport
+                .rearm()
+                .map_err(|cause| transport_error(CaptureStage::Open, cause))?;
+            protocol::capture_with_metadata(&mut self.transport, options, cancel, |phase| {
+                self.monitor.event(phase);
+                event(phase);
+            })
+        })
     }
 
     /// Successive placements with metadata, retaining existing cleanup semantics.
@@ -142,25 +264,73 @@ impl Reader {
         event: impl FnMut(CaptureEvent),
         image: impl FnMut(CapturedImage) -> Result<std::ops::ControlFlow<()>>,
     ) -> Result<()> {
-        protocol::capture_continuous_with_metadata(
-            &mut self.transport,
-            options,
-            cancel,
-            event,
-            image,
-        )
+        self.capture_continuous_next(options, cancel, event, image)
+    }
+
+    /// Repeated placements while retaining the interface after completion.
+    pub fn capture_continuous_next(
+        &mut self,
+        options: CaptureOptions,
+        cancel: &AtomicBool,
+        event: impl FnMut(CaptureEvent),
+        image: impl FnMut(CapturedImage) -> Result<std::ops::ControlFlow<()>>,
+    ) -> Result<()> {
+        self.capture_continuous_detailed(options, cancel, event, image)
+            .map(|_| ())
+    }
+    pub fn capture_continuous_detailed(
+        &mut self,
+        options: CaptureOptions,
+        cancel: &AtomicBool,
+        mut event: impl FnMut(CaptureEvent),
+        image: impl FnMut(CapturedImage) -> Result<std::ops::ControlFlow<()>>,
+    ) -> Result<protocol::ContinuousStop> {
+        let result = self.monitor.observe(|| {
+            self.transport
+                .rearm()
+                .map_err(|cause| transport_error(CaptureStage::Open, cause))?;
+            protocol::capture_continuous_detailed(
+                &mut self.transport,
+                options,
+                cancel,
+                |phase| {
+                    self.monitor.event(phase);
+                    event(phase);
+                },
+                image,
+            )
+        });
+        if let Ok(protocol::ContinuousStop::Cancelled { stage }) = &result {
+            self.monitor
+                .finish(Some(crate::error::CaptureFailure::from_error(
+                    &CaptureError::new(
+                        CaptureErrorKind::Cancelled,
+                        *stage,
+                        "continuous capture cancelled",
+                    )
+                    .into(),
+                )));
+        }
+        result
     }
     /// Capture each placement, waiting for finger removal between images.
     /// The callback can break to stop. Cancellation also stops successfully;
     /// device, image, callback, and cleanup failures remain errors.
     pub fn capture_continuous(
-        mut self,
+        self,
         options: CaptureOptions,
         cancel: &AtomicBool,
         event: impl FnMut(CaptureEvent),
-        image: impl FnMut(Image) -> Result<std::ops::ControlFlow<()>>,
+        mut image: impl FnMut(Image) -> Result<std::ops::ControlFlow<()>>,
     ) -> Result<()> {
-        protocol::capture_continuous(&mut self.transport, options, cancel, event, image)
+        self.capture_continuous_with_metadata(options, cancel, event, |captured| {
+            image(captured.image)
+        })
+    }
+}
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.monitor.released();
     }
 }
 
@@ -169,6 +339,31 @@ struct UsbTransport {
     interrupt: Endpoint<Interrupt, In>,
     image: Endpoint<Bulk, In>,
     cancelled: bool,
+}
+impl UsbTransport {
+    fn rearm(&mut self) -> Result<()> {
+        if !self.cancelled {
+            return Ok(());
+        }
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while self.image.pending() > 0 {
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "image cancellation did not drain"
+            );
+            let _ = self.image.wait_next_complete(Duration::from_millis(20));
+        }
+        while self.interrupt.pending() > 0 {
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "interrupt cancellation did not drain"
+            );
+            let _ = self.interrupt.wait_next_complete(Duration::from_millis(20));
+        }
+        self.interrupt.submit(Buffer::new(64));
+        self.cancelled = false;
+        Ok(())
+    }
 }
 impl Transport for UsbTransport {
     fn read_registers(&mut self, register: u16, length: u16, timeout: Duration) -> Result<Vec<u8>> {

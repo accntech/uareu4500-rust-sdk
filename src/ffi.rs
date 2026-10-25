@@ -2,9 +2,12 @@
 //! Version 1 C ABI. See `include/uareu.h` for ownership and concurrency rules.
 //! Existing Rust capture APIs do not use this registry or change their behavior.
 use crate::{
+    error::{CaptureError, CaptureErrorKind, CaptureFailure, CaptureStage},
     metadata::CapturedImage,
     protocol::{CaptureEvent, CaptureOptions},
     quality,
+    reader::{ReaderCapabilities, ReaderMonitor},
+    task::CaptureTask,
     usb::{self, Reader},
 };
 use std::{
@@ -31,35 +34,90 @@ pub const PANIC: u32 = 8;
 pub const INTERNAL_ERROR: u32 = 9;
 
 type Result<T> = std::result::Result<T, Error>;
-#[derive(Debug)]
-struct Error(u32, String);
+#[derive(Clone, Debug)]
+struct Error(u32, String, Option<CaptureFailure>);
 fn error(code: u32, message: impl Into<String>) -> Error {
-    Error(code, message.into())
+    Error(code, message.into(), None)
 }
 fn mapped(code: u32, cause: anyhow::Error) -> Error {
-    error(code, format!("{cause:#}"))
+    let failure = (cause.is::<CaptureError>()
+        || cause.is::<crate::task::TaskError>()
+        || cause.is::<crate::error::CleanupFailure>())
+    .then(|| CaptureFailure::from_error(&cause));
+    Error(code, format!("{cause:#}"), failure)
 }
 
-thread_local! { static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) }; }
+#[derive(Clone, Default, serde::Serialize)]
+struct ErrorReport {
+    schema_version: u32,
+    status: u32,
+    kind: String,
+    stage: Option<CaptureStage>,
+    message: String,
+    cleanup: Option<Box<CaptureFailure>>,
+}
+impl ErrorReport {
+    fn from_failure(failure: Error) -> Self {
+        let generic = match failure.0 {
+            INVALID_ARGUMENT => "invalid_argument",
+            INVALID_HANDLE => "invalid_handle",
+            BUFFER_TOO_SMALL => "buffer_too_small",
+            BUSY => "busy",
+            CANCELLED => "cancelled",
+            DEVICE_ERROR => "device_error",
+            IMAGE_ERROR => "image_error",
+            PANIC => "panic",
+            _ => "internal_error",
+        };
+        Self {
+            schema_version: 1,
+            status: failure.0,
+            kind: failure.2.as_ref().map_or_else(
+                || generic.into(),
+                |detail| {
+                    serde_json::to_value(detail.kind)
+                        .expect("enum serialization")
+                        .as_str()
+                        .unwrap()
+                        .into()
+                },
+            ),
+            stage: failure.2.as_ref().and_then(|detail| detail.stage),
+            cleanup: failure.2.and_then(|detail| detail.cleanup),
+            message: failure.1,
+        }
+    }
+    fn cleared() -> Self {
+        Self {
+            schema_version: 1,
+            kind: "none".into(),
+            ..Self::default()
+        }
+    }
+}
+thread_local! { static LAST_ERROR: RefCell<ErrorReport> = RefCell::new(ErrorReport::cleared()); }
 
 fn boundary(operation: impl FnOnce() -> Result<()>) -> u32 {
     let result = catch_unwind(AssertUnwindSafe(operation));
     let failure = match result {
         Ok(Ok(())) => {
-            LAST_ERROR.with(|last| last.borrow_mut().clear());
+            LAST_ERROR.with(|last| *last.borrow_mut() = ErrorReport::cleared());
             return OK;
         }
         Ok(Err(error)) => error,
         Err(_) => error(PANIC, "Rust panic contained at the DLL boundary"),
     };
-    LAST_ERROR.with(|last| *last.borrow_mut() = failure.1);
-    failure.0
+    let status = failure.0;
+    LAST_ERROR.with(|last| *last.borrow_mut() = ErrorReport::from_failure(failure));
+    status
 }
 
 struct ReaderState {
     closed: bool,
     idle_reader: Option<Reader>,
     active: Option<Arc<AtomicBool>>,
+    monitor: ReaderMonitor,
+    persistent: bool,
 }
 impl ReaderState {
     fn cancel(&self) -> Result<()> {
@@ -77,6 +135,7 @@ impl ReaderState {
         }
         self.closed = true;
         self.idle_reader.take();
+        self.monitor.close();
     }
 }
 struct ReaderContext {
@@ -92,6 +151,8 @@ enum Object {
     List(Arc<Vec<nusb::DeviceInfo>>),
     Reader(Arc<ReaderContext>),
     Image(Arc<ImageEntry>),
+    Task(Arc<CaptureTask>),
+    Data(Arc<Vec<u8>>),
 }
 struct Registry {
     next: u64,
@@ -166,6 +227,12 @@ struct CaptureGuard {
 }
 impl CaptureGuard {
     fn begin(shared: Arc<Mutex<ReaderState>>) -> Result<(Self, Option<Reader>)> {
+        Self::begin_mode(shared, true)
+    }
+    fn begin_mode(
+        shared: Arc<Mutex<ReaderState>>,
+        capture: bool,
+    ) -> Result<(Self, Option<Reader>)> {
         let mut state = shared
             .lock()
             .map_err(|_| error(INTERNAL_ERROR, "reader state is poisoned"))?;
@@ -177,6 +244,11 @@ impl CaptureGuard {
         }
         let cancel = Arc::new(AtomicBool::new(false));
         state.active = Some(Arc::clone(&cancel));
+        if capture {
+            state.monitor.begin();
+        } else {
+            state.monitor.begin_probe();
+        }
         let idle_reader = state.idle_reader.take();
         drop(state);
         Ok((
@@ -192,7 +264,141 @@ impl Drop for CaptureGuard {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() {
             state.active = None;
+            let snapshot = state.monitor.snapshot();
+            if snapshot.capture_active
+                || snapshot.operation == crate::reader::ReaderOperation::Probing
+            {
+                let failure = CaptureFailure {
+                    kind: if std::thread::panicking() {
+                        CaptureErrorKind::Panic
+                    } else {
+                        CaptureErrorKind::Other
+                    },
+                    stage: None,
+                    message: "reader operation aborted before completion".into(),
+                    cleanup: None,
+                };
+                if snapshot.capture_active {
+                    state.monitor.finish(Some(failure));
+                } else {
+                    state.monitor.finish_probe(Err(failure));
+                }
+            }
         }
+    }
+}
+impl CaptureGuard {
+    fn retain_mode(&self, device: Reader, persistent_only: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            if (!persistent_only || state.persistent) && !state.closed {
+                state.idle_reader = Some(device);
+            }
+        }
+    }
+    fn retain_after<T>(&self, device: Reader, result: &anyhow::Result<T>, persistent_only: bool) {
+        if !result.as_ref().err().is_some_and(is_disconnected) {
+            self.retain_mode(device, persistent_only);
+        }
+    }
+}
+fn is_disconnected(cause: &anyhow::Error) -> bool {
+    fn contains(failure: &CaptureFailure) -> bool {
+        failure.kind == CaptureErrorKind::Disconnected
+            || failure.cleanup.as_deref().is_some_and(contains)
+    }
+    contains(&CaptureFailure::from_error(cause))
+}
+/// Explicit hardware-register observation; never guesses readiness/calibration/DPI.
+/// # Safety
+/// output must point to writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_reader_probe(handle: u64, output: *mut u64) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let context = reader(handle)?;
+        let (guard, idle) = CaptureGuard::begin_mode(context.state.clone(), false)?;
+        let mut device = open_operation_reader(&context, idle, true).map_err(capture_error)?;
+        let result = device.probe_status();
+        guard.retain_after(device, &result, false);
+        let id = data(&result.map_err(capture_error)?)?;
+        unsafe { write(output, id) }
+    })
+}
+/// Known stop/low-power/queue recovery, distinct from vendor reset/calibration.
+#[unsafe(no_mangle)]
+pub extern "C" fn uareu_reader_recover(handle: u64) -> u32 {
+    boundary(|| {
+        let context = reader(handle)?;
+        let (guard, idle) = CaptureGuard::begin_mode(context.state.clone(), false)?;
+        let mut device = open_operation_reader(&context, idle, true).map_err(capture_error)?;
+        let result = device.recover_interface();
+        guard.retain_after(device, &result, false);
+        result.map_err(capture_error)
+    })
+}
+fn open_operation_reader(
+    context: &ReaderContext,
+    idle: Option<Reader>,
+    probing: bool,
+) -> anyhow::Result<Reader> {
+    if let Some(reader) = idle {
+        return Ok(reader);
+    }
+    let monitor = context
+        .state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("reader state is poisoned"))?
+        .monitor
+        .clone();
+    match Reader::open(&context.info) {
+        Ok(reader) => Ok(reader.with_monitor(monitor)),
+        Err(cause) => {
+            let failure = CaptureFailure::from_error(&cause);
+            if probing {
+                monitor.finish_probe(Err(failure));
+            } else {
+                monitor.finish(Some(failure));
+            }
+            Err(cause)
+        }
+    }
+}
+fn capture_once(
+    context: Arc<ReaderContext>,
+    guard: CaptureGuard,
+    idle: Option<Reader>,
+    options: CaptureOptions,
+    event: impl FnMut(CaptureEvent),
+) -> anyhow::Result<CapturedImage> {
+    let mut device = open_operation_reader(&context, idle, false)?;
+    let result = device.capture_next(options, &guard.cancel, event);
+    guard.retain_after(device, &result, true);
+    result
+}
+fn capture_error(cause: anyhow::Error) -> Error {
+    if cause.downcast_ref::<crate::task::TaskError>()
+        == Some(&crate::task::TaskError::WorkerPanicked)
+    {
+        return mapped(PANIC, cause);
+    }
+    mapped(
+        if cause
+            .downcast_ref::<CaptureError>()
+            .is_some_and(|e| e.kind == CaptureErrorKind::Cancelled)
+        {
+            CANCELLED
+        } else {
+            DEVICE_ERROR
+        },
+        cause,
+    )
+}
+fn task(handle: u64) -> Result<Arc<CaptureTask>> {
+    match lookup(handle)? {
+        Object::Task(task) => Ok(task),
+        _ => Err(error(INVALID_HANDLE, "expected task handle")),
     }
 }
 fn register_image(captured: CapturedImage) -> Result<u64> {
@@ -295,13 +501,132 @@ pub unsafe extern "C" fn uareu_last_error(
     required: *mut usize,
 ) -> u32 {
     match catch_unwind(AssertUnwindSafe(|| {
-        let message = LAST_ERROR.with(|last| last.borrow().clone());
+        let message = LAST_ERROR.with(|last| last.borrow().message.clone());
         unsafe { copy_buffer(message.as_bytes(), true, buffer, capacity, required) }
     })) {
         Ok(Ok(())) => OK,
         Ok(Err(error)) => error.0,
         Err(_) => PANIC,
     }
+}
+
+/// Structured thread-local error. Probes/copies do not clear or replace it.
+/// # Safety
+/// Buffer/required pointers follow the contract of `uareu_last_error`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_last_error_json(
+    buffer: *mut u8,
+    capacity: usize,
+    required: *mut usize,
+) -> u32 {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let report = LAST_ERROR.with(|last| last.borrow().clone());
+        let bytes = serde_json::to_vec(&report)
+            .map_err(|cause| error(INTERNAL_ERROR, cause.to_string()))?;
+        unsafe { copy_buffer(&bytes, true, buffer, capacity, required) }
+    })) {
+        Ok(Ok(())) => OK,
+        Ok(Err(error)) => error.0,
+        Err(_) => PANIC,
+    }
+}
+
+/// Capabilities of the SDK's supported USB profile, without opening the reader.
+/// # Safety
+/// Buffer/required pointers follow the contract of `uareu_last_error`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_reader_list_get_capabilities_json(
+    handle: u64,
+    index: u32,
+    buffer: *mut u8,
+    capacity: usize,
+    required: *mut usize,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(required, 0)?;
+        }
+        let devices = list(handle)?;
+        let info = devices
+            .get(index as usize)
+            .ok_or_else(|| error(INVALID_ARGUMENT, "reader index out of range"))?;
+        let capabilities = ReaderCapabilities::for_usb_id(info.vendor_id(), info.product_id())
+            .ok_or_else(|| error(DEVICE_ERROR, "unsupported USB profile"))?;
+        let bytes = serde_json::to_vec(&capabilities)
+            .map_err(|cause| error(INTERNAL_ERROR, cause.to_string()))?;
+        unsafe { copy_buffer(&bytes, true, buffer, capacity, required) }
+    })
+}
+
+/// Cached SDK status, never a live USB/hardware status query.
+/// # Safety
+/// Buffer/required pointers follow the contract of `uareu_last_error`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_reader_get_status_json(
+    handle: u64,
+    buffer: *mut u8,
+    capacity: usize,
+    required: *mut usize,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(required, 0)?;
+        }
+        let context = reader(handle)?;
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| error(INTERNAL_ERROR, "reader state is poisoned"))?;
+        if state.closed {
+            return Err(error(INVALID_HANDLE, "reader is closed"));
+        }
+        let mut value = serde_json::to_value(state.monitor.snapshot())
+            .map_err(|cause| error(INTERNAL_ERROR, cause.to_string()))?;
+        value["busy"] = serde_json::json!(state.active.is_some());
+        value["persistent_session"] = serde_json::json!(state.persistent);
+        value["cancellation_requested"] = serde_json::json!(
+            state
+                .active
+                .as_ref()
+                .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+        );
+        let bytes =
+            serde_json::to_vec(&value).map_err(|cause| error(INTERNAL_ERROR, cause.to_string()))?;
+        drop(state);
+        unsafe { copy_buffer(&bytes, true, buffer, capacity, required) }
+    })
+}
+
+/// Capabilities for an open reader handle, without USB I/O.
+/// # Safety
+/// Buffer/required pointers follow the contract of `uareu_last_error`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_reader_get_capabilities_json(
+    handle: u64,
+    buffer: *mut u8,
+    capacity: usize,
+    required: *mut usize,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(required, 0)?;
+        }
+        let context = reader(handle)?;
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| error(INTERNAL_ERROR, "reader state is poisoned"))?;
+        if state.closed {
+            return Err(error(INVALID_HANDLE, "reader is closed"));
+        }
+        let capabilities =
+            ReaderCapabilities::for_usb_id(context.info.vendor_id(), context.info.product_id())
+                .ok_or_else(|| error(DEVICE_ERROR, "unsupported USB profile"))?;
+        let bytes = serde_json::to_vec(&capabilities)
+            .map_err(|cause| error(INTERNAL_ERROR, cause.to_string()))?;
+        drop(state);
+        unsafe { copy_buffer(&bytes, true, buffer, capacity, required) }
+    })
 }
 
 /// Snapshot connected supported readers without claiming their interfaces.
@@ -374,21 +699,39 @@ pub extern "C" fn uareu_reader_list_free(handle: u64) -> u32 {
 /// `output` must point to writable u64 storage.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn uareu_reader_open(handle: u64, index: u32, output: *mut u64) -> u32 {
+    unsafe { uareu_reader_open_ex(handle, index, 0, output) }
+}
+/// Open flags: bit 0 retains the interface between captures. Other bits fail.
+/// # Safety
+/// `output` must point to writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_reader_open_ex(
+    handle: u64,
+    index: u32,
+    flags: u32,
+    output: *mut u64,
+) -> u32 {
     boundary(|| {
         unsafe {
             write(output, 0)?;
+        }
+        if flags & !1 != 0 {
+            return Err(error(INVALID_ARGUMENT, "unknown reader flags"));
         }
         let info = list(handle)?
             .get(index as usize)
             .cloned()
             .ok_or_else(|| error(INVALID_ARGUMENT, "reader index out of range"))?;
         let idle_reader = Reader::open(&info).map_err(|cause| mapped(DEVICE_ERROR, cause))?;
+        let monitor = idle_reader.status_monitor();
         let context = ReaderContext {
             info,
             state: Arc::new(Mutex::new(ReaderState {
                 closed: false,
                 idle_reader: Some(idle_reader),
                 active: None,
+                monitor,
+                persistent: flags & 1 != 0,
             })),
         };
         let id = insert(Object::Reader(Arc::new(context)))?;
@@ -451,7 +794,267 @@ pub unsafe extern "C" fn uareu_capture(
 /// Optional phase notification, synchronous on the capture thread. Foreign
 /// callbacks must not throw/unwind, and their context must outlive this call.
 pub type CaptureCallback = unsafe extern "C" fn(u32, *mut std::ffi::c_void);
+/// The callback owns each image handle. Return 0 to continue, 1 to stop.
+pub type ImageCallback = unsafe extern "C" fn(u64, *mut std::ffi::c_void) -> u32;
 
+/// Repeated placements, not video streaming. Callback owns each image handle.
+/// # Safety
+/// Callbacks/context must remain valid and must not unwind for the entire call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_capture_continuous(
+    handle: u64,
+    timeout_ms: u32,
+    rotate180: u32,
+    callback: Option<ImageCallback>,
+    phase: Option<CaptureCallback>,
+    callback_context: *mut std::ffi::c_void,
+) -> u32 {
+    boundary(|| {
+        if !(1..=3_600_000).contains(&timeout_ms) || rotate180 > 1 || callback.is_none() {
+            return Err(error(
+                INVALID_ARGUMENT,
+                "invalid continuous capture options/callback",
+            ));
+        }
+        let callback = callback.unwrap();
+        let context = reader(handle)?;
+        let (guard, idle) = CaptureGuard::begin(context.state.clone())?;
+        let mut device = open_operation_reader(&context, idle, false).map_err(capture_error)?;
+        let mut callback_error = None;
+        let result = device.capture_continuous_detailed(
+            CaptureOptions {
+                timeout: Duration::from_millis(timeout_ms.into()),
+                rotate180: rotate180 == 1,
+            },
+            &guard.cancel,
+            |event| {
+                if let Some(phase) = phase {
+                    unsafe { phase(phase_number(event), callback_context) }
+                }
+            },
+            |image| {
+                let image = match register_image(image) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        callback_error = Some(error);
+                        return Err(anyhow::anyhow!("cannot register capture image"));
+                    }
+                };
+                match unsafe { callback(image, callback_context) } {
+                    0 => Ok(std::ops::ControlFlow::Continue(())),
+                    1 => Ok(std::ops::ControlFlow::Break(())),
+                    _ => {
+                        callback_error =
+                            Some(error(INVALID_ARGUMENT, "image callback must return 0 or 1"));
+                        Err(anyhow::anyhow!("invalid callback action"))
+                    }
+                }
+            },
+        );
+        guard.retain_after(device, &result, true);
+        if let Some(error) = callback_error {
+            return Err(error);
+        }
+        match result.map_err(capture_error)? {
+            crate::protocol::ContinuousStop::Callback => Ok(()),
+            crate::protocol::ContinuousStop::Cancelled { stage } => Err(capture_error(
+                CaptureError::new(
+                    CaptureErrorKind::Cancelled,
+                    stage,
+                    "continuous capture cancelled",
+                )
+                .into(),
+            )),
+        }
+    })
+}
+fn phase_number(event: CaptureEvent) -> u32 {
+    match event {
+        CaptureEvent::Initializing => 1,
+        CaptureEvent::WaitingForFinger => 2,
+        CaptureEvent::WaitingForFingerRemoval => 3,
+        CaptureEvent::Capturing => 4,
+    }
+}
+
+/// Start an asynchronous capture, reserving the reader before returning.
+/// # Safety
+/// `output` must point to writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_capture_start(
+    handle: u64,
+    timeout_ms: u32,
+    rotate180: u32,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        if !(1..=3_600_000).contains(&timeout_ms) || rotate180 > 1 {
+            return Err(error(INVALID_ARGUMENT, "invalid capture options"));
+        }
+        let context = reader(handle)?;
+        let (guard, idle) = CaptureGuard::begin(context.state.clone())?;
+        let cancel = guard.cancel.clone();
+        let job = CaptureTask::spawn(cancel, move |_| {
+            capture_once(
+                context,
+                guard,
+                idle,
+                CaptureOptions {
+                    timeout: Duration::from_millis(timeout_ms.into()),
+                    rotate180: rotate180 == 1,
+                },
+                |_| {},
+            )
+        })
+        .map_err(|cause| mapped(INTERNAL_ERROR, cause))?;
+        let id = insert(Object::Task(Arc::new(job)))?;
+        unsafe { write(output, id) }
+    })
+}
+/// Wait/poll. completed=0 means pending; completed=1 consumes the result once.
+/// Errors are copied to this calling thread's last-error report.
+/// # Safety
+/// Both output pointers must be writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_task_wait(
+    handle: u64,
+    timeout_ms: u32,
+    output: *mut u64,
+    completed: *mut u32,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+            write(completed, 0)?;
+        }
+        if timeout_ms > 3_600_000 {
+            return Err(error(INVALID_ARGUMENT, "wait timeout exceeds one hour"));
+        }
+        let job = task(handle)?;
+        if job.status().consumed {
+            return Err(error(
+                INVALID_ARGUMENT,
+                "capture completion already consumed",
+            ));
+        }
+        match job.wait(Duration::from_millis(timeout_ms.into())) {
+            Ok(None) => Ok(()),
+            Ok(Some(image)) => {
+                unsafe {
+                    write(completed, 1)?;
+                }
+                let id = register_image(image)?;
+                unsafe { write(output, id) }
+            }
+            Err(cause) => {
+                if cause.is::<crate::task::TaskError>()
+                    && cause.downcast_ref::<crate::task::TaskError>()
+                        != Some(&crate::task::TaskError::WorkerPanicked)
+                {
+                    return Err(error(INVALID_ARGUMENT, cause.to_string()));
+                }
+                unsafe {
+                    write(completed, 1)?;
+                }
+                Err(capture_error(cause))
+            }
+        }
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn uareu_task_cancel(handle: u64) -> u32 {
+    boundary(|| {
+        task(handle)?.cancel();
+        Ok(())
+    })
+}
+/// # Safety
+/// Buffer contract is identical to uareu_last_error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_task_get_status_json(
+    handle: u64,
+    buffer: *mut u8,
+    capacity: usize,
+    required: *mut usize,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(required, 0)?;
+        }
+        let bytes = serde_json::to_vec(&task(handle)?.status())
+            .map_err(|e| error(INTERNAL_ERROR, e.to_string()))?;
+        unsafe { copy_buffer(&bytes, true, buffer, capacity, required) }
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn uareu_task_free(handle: u64) -> u32 {
+    boundary(|| {
+        let Object::Task(job) = release(handle, |object| matches!(object, Object::Task(_)))? else {
+            unreachable!()
+        };
+        job.close().map_err(|e| mapped(INTERNAL_ERROR, e))
+    })
+}
+
+/// JSON request/response helpers use immutable data handles, separate from images.
+/// # Safety
+/// Buffer contract is identical to uareu_last_error (including the terminator).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_data_get_json(
+    handle: u64,
+    buffer: *mut u8,
+    capacity: usize,
+    required: *mut usize,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(required, 0)?;
+        }
+        let Object::Data(data) = lookup(handle)? else {
+            return Err(error(INVALID_HANDLE, "expected data handle"));
+        };
+        unsafe { copy_buffer(&data, true, buffer, capacity, required) }
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn uareu_data_free(handle: u64) -> u32 {
+    boundary(|| {
+        release(handle, |object| matches!(object, Object::Data(_)))?;
+        Ok(())
+    })
+}
+/// Import an immutable JSON value (template/enrollment/encoded-data container).
+/// # Safety
+/// input must hold length readable bytes and output must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_data_from_json(
+    input: *const u8,
+    length: usize,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let value: serde_json::Value = unsafe { json_input(input, length)? };
+        let id = data(&value)?;
+        unsafe { write(output, id) }
+    })
+}
+unsafe fn json_input<T: serde::de::DeserializeOwned>(input: *const u8, length: usize) -> Result<T> {
+    if input.is_null() || length == 0 || length > 16 * 1024 * 1024 {
+        return Err(error(INVALID_ARGUMENT, "invalid JSON input size/pointer"));
+    }
+    serde_json::from_slice(unsafe { std::slice::from_raw_parts(input, length) })
+        .map_err(|e| error(INVALID_ARGUMENT, e.to_string()))
+}
+fn data(value: &impl serde::Serialize) -> Result<u64> {
+    let bytes = serde_json::to_vec(value).map_err(|e| error(INTERNAL_ERROR, e.to_string()))?;
+    insert(Object::Data(Arc::new(bytes)))
+}
 /// Capture with the same phase notifications used by the CLI.
 /// # Safety
 /// `output` follows `uareu_capture`; callback/context must remain valid until
@@ -477,16 +1080,14 @@ pub unsafe extern "C" fn uareu_capture_with_callback(
         }
         let context = reader(handle)?;
         let (guard, idle_reader) = CaptureGuard::begin(Arc::clone(&context.state))?;
-        let device = match idle_reader {
-            Some(reader) => reader,
-            None => Reader::open(&context.info).map_err(|cause| mapped(DEVICE_ERROR, cause))?,
-        };
-        let result = device.capture_with_metadata(
+        let result = capture_once(
+            context,
+            guard,
+            idle_reader,
             CaptureOptions {
                 timeout: Duration::from_millis(u64::from(timeout_ms)),
                 rotate180: rotate180 == 1,
             },
-            &guard.cancel,
             |event| {
                 if let Some(callback) = callback {
                     let phase = match event {
@@ -499,19 +1100,7 @@ pub unsafe extern "C" fn uareu_capture_with_callback(
                 }
             },
         );
-        let captured = match result {
-            Ok(captured) => captured,
-            Err(cause) => {
-                return Err(mapped(
-                    if guard.cancel.load(Ordering::Relaxed) {
-                        CANCELLED
-                    } else {
-                        DEVICE_ERROR
-                    },
-                    cause,
-                ));
-            }
-        };
+        let captured = result.map_err(capture_error)?;
         let id = register_image(captured)?;
         unsafe { write(output, id) }
     })
@@ -662,6 +1251,74 @@ mod tests {
     }
 
     #[test]
+    fn structured_error_getters_preserve_error_and_legacy_codes() {
+        for (kind, legacy) in [
+            (CaptureErrorKind::Timeout, DEVICE_ERROR),
+            (CaptureErrorKind::Disconnected, DEVICE_ERROR),
+            (CaptureErrorKind::Cancelled, CANCELLED),
+        ] {
+            assert_eq!(
+                boundary(|| Err(mapped(
+                    legacy,
+                    CaptureError::new(kind, CaptureStage::FingerWait, "injected cause").into()
+                ))),
+                legacy
+            );
+            let mut required = 0;
+            assert_eq!(
+                unsafe { uareu_last_error_json(null_mut(), 0, &mut required) },
+                BUFFER_TOO_SMALL
+            );
+            let mut tiny = [99u8; 1];
+            assert_eq!(
+                unsafe { uareu_last_error_json(tiny.as_mut_ptr(), 1, &mut required) },
+                BUFFER_TOO_SMALL
+            );
+            assert_eq!(tiny, [99]);
+            let mut bytes = vec![0; required];
+            assert_eq!(
+                unsafe { uareu_last_error_json(bytes.as_mut_ptr(), bytes.len(), &mut required) },
+                OK
+            );
+            let report: serde_json::Value =
+                serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+            assert_eq!(report["status"], legacy);
+            assert_eq!(report["kind"], serde_json::to_value(kind).unwrap());
+            assert_eq!(report["stage"], "finger_wait");
+            assert!(last_error().contains("injected cause"));
+            std::thread::spawn(|| {
+                assert_eq!(
+                    boundary(|| Err(error(INVALID_ARGUMENT, "other thread"))),
+                    INVALID_ARGUMENT
+                );
+                assert_eq!(
+                    LAST_ERROR.with(|last| last.borrow().kind.clone()),
+                    "invalid_argument"
+                );
+            })
+            .join()
+            .unwrap();
+            assert!(last_error().contains("injected cause"));
+        }
+        assert_eq!(boundary(|| Ok(())), OK);
+        assert_eq!(LAST_ERROR.with(|last| last.borrow().kind.clone()), "none");
+        let mut required = 123;
+        assert_eq!(
+            unsafe { uareu_reader_get_status_json(0, null_mut(), 0, &mut required) },
+            INVALID_HANDLE
+        );
+        assert_eq!(required, 0);
+        assert_eq!(
+            unsafe { uareu_reader_get_capabilities_json(0, null_mut(), 0, &mut required) },
+            INVALID_HANDLE
+        );
+        assert_eq!(
+            unsafe { uareu_reader_list_get_capabilities_json(0, 0, null_mut(), 0, &mut required) },
+            INVALID_HANDLE
+        );
+    }
+
+    #[test]
     fn image_abi_preserves_pixels_metadata_and_ownership() {
         let captured = crate::frame::decode_frame_with_metadata(
             include_bytes!("../fixtures/synthetic-plain.wire"),
@@ -783,13 +1440,17 @@ mod tests {
             closed: false,
             idle_reader: None,
             active: None,
+            monitor: ReaderMonitor::default(),
+            persistent: false,
         }));
         shared.lock().unwrap().cancel().unwrap();
         let (first, _) = CaptureGuard::begin(Arc::clone(&shared)).unwrap();
+        let monitor = shared.lock().unwrap().monitor.clone();
+        assert!(monitor.snapshot().capture_active);
         assert!(!first.cancel.load(Ordering::Relaxed));
         assert!(matches!(
             CaptureGuard::begin(Arc::clone(&shared)),
-            Err(Error(BUSY, _))
+            Err(Error(BUSY, _, _))
         ));
         let other = Arc::clone(&shared);
         std::thread::spawn(move || other.lock().unwrap().cancel().unwrap())
@@ -797,26 +1458,68 @@ mod tests {
             .unwrap();
         assert!(first.cancel.load(Ordering::Relaxed));
         drop(first);
+        assert!(!monitor.snapshot().capture_active);
         let (second, _) = CaptureGuard::begin(Arc::clone(&shared)).unwrap();
         assert!(
             !second.cancel.load(Ordering::Relaxed),
             "a previous cancellation must not affect the next call"
         );
         shared.lock().unwrap().close();
+        assert_eq!(
+            monitor.snapshot().operation,
+            crate::reader::ReaderOperation::Closed
+        );
         assert!(second.cancel.load(Ordering::Relaxed));
         drop(second);
         assert!(matches!(
             CaptureGuard::begin(Arc::clone(&shared)),
-            Err(Error(INVALID_HANDLE, _))
+            Err(Error(INVALID_HANDLE, _, _))
         ));
     }
 
+    #[test]
+    fn cleanup_disconnect_discards_session_without_replacing_primary_error() {
+        let primary: anyhow::Error = CaptureError::new(
+            CaptureErrorKind::Timeout,
+            CaptureStage::Acquisition,
+            "deadline",
+        )
+        .into();
+        assert!(!is_disconnected(&primary));
+        let combined = crate::error::attach_cleanup(
+            primary,
+            Err(CaptureError::new(
+                CaptureErrorKind::Disconnected,
+                CaptureStage::Cleanup,
+                "reader unplugged",
+            )
+            .into()),
+        );
+        let combined = crate::error::attach_cleanup(
+            combined,
+            Err(CaptureError::new(
+                CaptureErrorKind::Transport,
+                CaptureStage::Cleanup,
+                "queue drain failed",
+            )
+            .into()),
+        );
+        assert!(is_disconnected(&combined));
+        let report = CaptureFailure::from_error(&combined);
+        assert_eq!(report.kind, CaptureErrorKind::Timeout);
+        let first = report.cleanup.unwrap();
+        assert_eq!(first.kind, CaptureErrorKind::Disconnected);
+        assert_eq!(first.cleanup.unwrap().kind, CaptureErrorKind::Transport);
+        assert_eq!(capture_error(combined).0, DEVICE_ERROR);
+    }
     #[test]
     fn panics_are_contained_and_capture_lease_is_released() {
         let shared = Arc::new(Mutex::new(ReaderState {
             closed: false,
             idle_reader: None,
             active: None,
+            monitor: ReaderMonitor::default(),
+            persistent: false,
         }));
         assert_eq!(
             boundary(|| {
@@ -827,6 +1530,34 @@ mod tests {
         );
         assert!(last_error().contains("panic contained"));
         assert!(shared.lock().unwrap().active.is_none());
-        assert!(CaptureGuard::begin(shared).is_ok());
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .monitor
+                .snapshot()
+                .last_outcome
+                .unwrap()
+                .failure
+                .unwrap()
+                .kind,
+            CaptureErrorKind::Panic
+        );
+        assert!(CaptureGuard::begin(shared.clone()).is_ok());
+        assert_eq!(
+            boundary(|| {
+                let (_guard, _) = CaptureGuard::begin_mode(shared.clone(), false)?;
+                panic!("injected probe failure");
+            }),
+            PANIC
+        );
+        let state = shared.lock().unwrap();
+        assert!(state.active.is_none());
+        let status = state.monitor.snapshot();
+        assert_eq!(status.operation, crate::reader::ReaderOperation::Idle);
+        assert_eq!(
+            status.last_probe_failure.unwrap().kind,
+            CaptureErrorKind::Panic
+        );
     }
 }
