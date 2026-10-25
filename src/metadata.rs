@@ -27,6 +27,9 @@ pub enum Resolution {
 pub enum ResolutionProvenance {
     CallerDeclared,
     PngPhysicalDimensions,
+    WsqCommentDeclaration,
+    TemplateHeaderDeclaration { format: String },
+    ImageRecordHeaderDeclaration,
     DeviceReported { evidence: String },
     DocumentedProfile { evidence: String },
 }
@@ -95,6 +98,8 @@ pub enum ProcessingStep {
     IntensityInversion,
     Rotate180,
     ContrastStretch { lower: u8, upper: u8 },
+    WsqDecompression,
+    ImageRecordImport,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

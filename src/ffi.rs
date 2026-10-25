@@ -1090,6 +1090,111 @@ pub unsafe extern "C" fn uareu_image_from_pixels(
     })
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WsqConfig {
+    encoder: std::path::PathBuf,
+    decoder: std::path::PathBuf,
+    timeout_ms: Option<u64>,
+    bitrate: Option<f64>,
+}
+impl WsqConfig {
+    fn codec(&self) -> Result<crate::wsq::WsqCodec> {
+        let timeout = self.timeout_ms.unwrap_or(30_000);
+        if !(1..=300_000).contains(&timeout) {
+            return Err(error(INVALID_ARGUMENT, "codec deadline out of range"));
+        }
+        Ok(crate::wsq::WsqCodec {
+            encoder: self.encoder.clone(),
+            decoder: self.decoder.clone(),
+            timeout: Duration::from_millis(timeout),
+        })
+    }
+}
+/// External NBIS codec; output is a data handle containing a JSON byte array.
+/// # Safety
+/// config must contain length readable JSON bytes; output must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_encode_wsq(
+    handle: u64,
+    config: *const u8,
+    length: usize,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let config: WsqConfig = unsafe { json_input(config, length)? };
+        let bytes = config
+            .codec()?
+            .encode(&image(handle)?.captured, config.bitrate.unwrap_or(0.75))
+            .map_err(|e| mapped(IMAGE_ERROR, e))?;
+        let id = data(&bytes)?;
+        unsafe { write(output, id) }
+    })
+}
+/// Decode a JSON-byte-array data handle using external NBIS, preserving its PPI declaration.
+/// # Safety
+/// config must contain length readable JSON bytes; output must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_decode_wsq(
+    handle: u64,
+    config: *const u8,
+    length: usize,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let config: WsqConfig = unsafe { json_input(config, length)? };
+        let bytes: Vec<u8> = read_data(handle)?;
+        let image = config
+            .codec()?
+            .decode(&bytes)
+            .map_err(|e| mapped(IMAGE_ERROR, e))?;
+        let id = register_image(image)?;
+        unsafe { write(output, id) }
+    })
+}
+/// Raw single-view ISO image record; config is explicit ImageRecordOptions JSON.
+/// # Safety
+/// config must contain length readable bytes and output must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_encode_record(
+    handle: u64,
+    config: *const u8,
+    length: usize,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let options = unsafe { json_input(config, length)? };
+        let bytes = crate::image_record::encode(&image(handle)?.captured, &options)
+            .map_err(|e| mapped(IMAGE_ERROR, e))?;
+        let id = data(&bytes)?;
+        unsafe { write(output, id) }
+    })
+}
+/// Decode a raw ISO image record stored as JSON-byte-array data handle.
+/// # Safety
+/// output must point to writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_decode_record(handle: u64, output: *mut u64) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let bytes: Vec<u8> = read_data(handle)?;
+        let decoded = crate::image_record::decode(&bytes).map_err(|e| mapped(IMAGE_ERROR, e))?;
+        let id = register_image(decoded.image)?;
+        unsafe { write(output, id) }
+    })
+}
+
 #[derive(Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AssessmentOptions {
@@ -1108,6 +1213,9 @@ unsafe fn json_input<T: serde::de::DeserializeOwned>(input: *const u8, length: u
 fn data(value: &impl serde::Serialize) -> Result<u64> {
     let bytes = serde_json::to_vec(value).map_err(|e| error(INTERNAL_ERROR, e.to_string()))?;
     insert(Object::Data(Arc::new(bytes)))
+}
+fn engine_data<T: serde::Serialize>(value: anyhow::Result<T>) -> Result<u64> {
+    data(&value.map_err(|e| mapped(IMAGE_ERROR, e))?)
 }
 /// Evaluate once and return an immutable report handle (so probing never reruns an engine).
 /// # Safety
@@ -1156,6 +1264,156 @@ pub unsafe extern "C" fn uareu_image_enhance(handle: u64, output: *mut u64) -> u
         let enhanced = crate::processing::enhance(&image(handle)?.captured)
             .map_err(|e| mapped(IMAGE_ERROR, e))?;
         let id = register_image(enhanced)?;
+        unsafe { write(output, id) }
+    })
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecognitionConfig {
+    executable: std::path::PathBuf,
+    timeout_ms: Option<u64>,
+    ppi: Option<f64>,
+}
+#[derive(serde::Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum RecognitionRequest {
+    ExportTemplate {
+        template: u64,
+        format: crate::template_io::TemplateFormat,
+        quality: u8,
+        impression: u8,
+    },
+    ImportTemplate {
+        data: u64,
+        format: crate::template_io::TemplateFormat,
+    },
+    Extract {
+        image: u64,
+    },
+    Compare {
+        probe: u64,
+        candidate: u64,
+        threshold: f64,
+    },
+    Identify {
+        probe: u64,
+        candidates: Vec<u64>,
+        threshold: f64,
+        maximum: usize,
+    },
+    Enroll {
+        samples: Vec<u64>,
+        threshold: f64,
+    },
+    VerifyEnrollment {
+        probe: u64,
+        enrollment: u64,
+        threshold: f64,
+    },
+}
+fn read_data<T: serde::de::DeserializeOwned>(handle: u64) -> Result<T> {
+    let Object::Data(bytes) = lookup(handle)? else {
+        return Err(error(INVALID_HANDLE, "expected data handle"));
+    };
+    serde_json::from_slice(&bytes).map_err(|e| error(INVALID_ARGUMENT, e.to_string()))
+}
+/// Optional recognition backend. JSON operations: extract/compare/identify/enroll/
+/// verify_enrollment. Input handles are borrowed; output is an owned data handle.
+/// # Safety
+/// Both JSON ranges must be readable; output must be writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_recognition_execute(
+    config: *const u8,
+    config_len: usize,
+    request: *const u8,
+    request_len: usize,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let config: RecognitionConfig = unsafe { json_input(config, config_len)? };
+        let request: RecognitionRequest = unsafe { json_input(request, request_len)? };
+        let timeout = config.timeout_ms.unwrap_or(30_000);
+        if !(1..=300_000).contains(&timeout) {
+            return Err(error(INVALID_ARGUMENT, "recognition timeout out of range"));
+        }
+        let engine = crate::recognition::RecognitionEngine {
+            executable: config.executable,
+            timeout: Duration::from_millis(timeout),
+        };
+        let id = match request {
+            RecognitionRequest::ExportTemplate {
+                template,
+                format,
+                quality,
+                impression,
+            } => {
+                let template = read_data(template)?;
+                engine_data(engine.export_template(&template, format, quality, impression))
+            }
+            RecognitionRequest::ImportTemplate {
+                data: handle,
+                format,
+            } => {
+                let bytes: Vec<u8> = read_data(handle)?;
+                engine_data(engine.import_template(&bytes, format))
+            }
+            RecognitionRequest::Extract { image: handle } => {
+                let mut captured = image(handle)?.captured.clone();
+                if let Some(ppi) = config.ppi {
+                    captured.metadata.resolution = crate::metadata::Resolution::declared(ppi, ppi)
+                        .map_err(|e| mapped(INVALID_ARGUMENT, e))?;
+                }
+                engine_data(engine.extract(&captured))
+            }
+            RecognitionRequest::Compare {
+                probe,
+                candidate,
+                threshold,
+            } => {
+                let probe = read_data(probe)?;
+                let candidate = read_data(candidate)?;
+                engine_data(engine.compare(&probe, &candidate, threshold))
+            }
+            RecognitionRequest::Identify {
+                probe,
+                candidates,
+                threshold,
+                maximum,
+            } => {
+                if candidates.len() > 1000 {
+                    return Err(error(INVALID_ARGUMENT, "too many candidates"));
+                }
+                let probe = read_data(probe)?;
+                let candidates = candidates
+                    .into_iter()
+                    .map(read_data)
+                    .collect::<Result<Vec<_>>>()?;
+                engine_data(engine.identify(&probe, &candidates, threshold, maximum))
+            }
+            RecognitionRequest::Enroll { samples, threshold } => {
+                if !(2..=10).contains(&samples.len()) {
+                    return Err(error(INVALID_ARGUMENT, "enrollment requires 2..10 samples"));
+                }
+                let samples = samples
+                    .into_iter()
+                    .map(read_data)
+                    .collect::<Result<Vec<_>>>()?;
+                engine_data(engine.enroll(&samples, threshold))
+            }
+            RecognitionRequest::VerifyEnrollment {
+                probe,
+                enrollment,
+                threshold,
+            } => {
+                let probe = read_data(probe)?;
+                let enrollment = read_data(enrollment)?;
+                engine_data(engine.verify_enrollment(&probe, &enrollment, threshold))
+            }
+        }?;
         unsafe { write(output, id) }
     })
 }

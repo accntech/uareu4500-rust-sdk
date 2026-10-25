@@ -69,6 +69,16 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     internal static extern uint uareu_image_from_pixels(uint width, uint height, byte[] pixels, nuint length, byte[]? metadata, nuint metadataLength, out ulong output);
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern uint uareu_image_encode_wsq(ulong image, byte[] config, nuint length, out ulong output);
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern uint uareu_image_decode_wsq(ulong data, byte[] config, nuint length, out ulong output);
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern uint uareu_image_encode_record(ulong image, byte[] config, nuint length, out ulong output);
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern uint uareu_image_decode_record(ulong data, out ulong image);
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern uint uareu_recognition_execute(byte[] config, nuint configLength, byte[] request, nuint requestLength, out ulong output);
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     internal static extern uint uareu_reader_close(ulong reader);
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     internal static extern uint uareu_capture(ulong reader, uint timeoutMs, uint rotate180, out ulong image);

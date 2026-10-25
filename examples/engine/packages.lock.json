@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net10.0": {
+      "SixLabors.ImageSharp": {
+        "type": "Direct",
+        "requested": "[4.1.3, )",
+        "resolved": "4.1.3",
+        "contentHash": "VzzKPgdC0ZupEg937iKpg2cEGXudnFyQRwiHfIvtCKSlFUaxVbLjW3AztDhyk06z+4NzD7IAlMf7fqU57WXyBQ==",
+        "dependencies": {
+          "System.IO.Hashing": "8.0.0"
+        }
+      },
+      "SourceAFIS": {
+        "type": "Direct",
+        "requested": "[3.14.0, )",
+        "resolved": "3.14.0",
+        "contentHash": "TLTICwNMqBROeEAa4JNeY5eW3PyBawg6hrSqqEZ/45RtM0+e6oVHIzL4AYipF1SC2BlKh+ofhgxnuaDmPqMzuA==",
+        "dependencies": {
+          "Dahomey.Cbor": "1.16.1",
+          "SixLabors.ImageSharp": "2.1.3"
+        }
+      },
+      "System.Formats.Cbor": {
+        "type": "Direct",
+        "requested": "[10.0.0, )",
+        "resolved": "10.0.0",
+        "contentHash": "LwRJEV71pikJ2lR1VOAAejWT62LKlgIXI66tpdxjeRSQISKZoOuOFQt0ArXWrW5sPIQL0tisvqkg1tPleglYaQ=="
+      },
+      "Dahomey.Cbor": {
+        "type": "Transitive",
+        "resolved": "1.16.1",
+        "contentHash": "NeFvt9CXi5Ew6ZnpjQsO4RoKfZiSZH3Ap7PCdqHryr/RL5WrrPl1+JbXny8ynNEmb6/1wDfT1F5I9fbPN6H84w=="
+      },
+      "System.IO.Hashing": {
+        "type": "Transitive",
+        "resolved": "8.0.0",
+        "contentHash": "ne1843evDugl0md7Fjzy6QjJrzsjh46ZKbhf8GwBXb5f/gw97J4bxMs0NQKifDuThh/f0bZ0e62NPl1jzTuRqA=="
+      }
+    }
+  }
+}

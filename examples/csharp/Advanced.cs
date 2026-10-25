@@ -5,7 +5,7 @@ using System.Text.Json;
 
 internal static class Advanced
 {
-    internal static readonly HashSet<string> Commands = ["--advanced-test", "--async-test", "--capture-async", "--continuous", "--enhance", "--probe", "--quality", "--recover", "--session-test"];
+    internal static readonly HashSet<string> Commands = ["--advanced-test", "--recognition-test", "--session-test", "--async-test", "--continuous", "--capture-async", "--quality", "--enhance", "--extract", "--compare", "--enroll", "--identify", "--verify-enrollment", "--export-template", "--import-template", "--wsq-encode", "--wsq-decode", "--probe", "--recover", "--image-record-encode", "--image-record-decode"];
     private sealed class Handles : IDisposable
     {
         private readonly List<(ulong Value, bool Image)> items = [];
@@ -29,6 +29,11 @@ internal static class Advanced
         byte[] bytes = Encoding.UTF8.GetBytes(path); Native.Check(Native.uareu_image_save_png(image, bytes, (nuint)bytes.Length)); Console.WriteLine($"Saved: {path}");
     }
     private static void WriteNew(string path, byte[] bytes) { using var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None); file.Write(bytes); }
+    private static ulong Recognize(string executable, object request, Handles handles, double? ppi = null)
+    {
+        byte[] config = Json(new { executable = Path.GetFullPath(executable), timeout_ms = 30_000, ppi }); byte[] input = Json(request);
+        Native.Check(Native.uareu_recognition_execute(config, (nuint)config.Length, input, (nuint)input.Length, out ulong output)); return handles.Data(output);
+    }
     private static double Number(string value) => double.Parse(value, CultureInfo.InvariantCulture);
     private static void Require(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); }
     private static ulong Open(bool persistent)
@@ -43,6 +48,7 @@ internal static class Advanced
         switch (args[0])
         {
             case "--advanced-test": OfflineTest(handles); return 0;
+            case "--recognition-test" when args.Length == 2: RecognitionTest(args[1], handles); return 0;
             case "--session-test": SessionTest(); return 0;
             case "--probe":
             case "--recover":
@@ -65,9 +71,72 @@ internal static class Advanced
                 byte[] config = Json(new { engine_path = args.Length == 3 ? Path.GetFullPath(args[2]) : null as string });
                 Native.Check(Native.uareu_image_assess(image, config, (nuint)config.Length, out ulong report)); handles.Data(report); Console.WriteLine(Data(report)); return 0;
             }
+            case "--image-record-encode" when args.Length == 4:
+            {
+                byte[] config = File.ReadAllBytes(args[3]);
+                Native.Check(Native.uareu_image_encode_record(Load(args[1], handles), config, (nuint)config.Length, out ulong encoded)); handles.Data(encoded);
+                using JsonDocument record = JsonDocument.Parse(Data(encoded)); WriteNew(args[2], record.RootElement.EnumerateArray().Select(p => p.GetByte()).ToArray()); return 0;
+            }
+            case "--image-record-decode" when args.Length == 3:
+            {
+                ulong encoded = ImportData(JsonSerializer.Serialize(File.ReadAllBytes(args[1]).Select(b => (int)b)), handles);
+                Native.Check(Native.uareu_image_decode_record(encoded, out ulong image)); handles.Image(image); Save(image, args[2]); return 0;
+            }
             case "--enhance" when args.Length == 3:
             {
                 Native.Check(Native.uareu_image_enhance(Load(args[1], handles), out ulong image)); handles.Image(image); Save(image, args[2]); return 0;
+            }
+            case "--extract" when args.Length is 4 or 5:
+            {
+                ulong template = Recognize(args[3], new { operation = "extract", image = Load(args[1], handles) }, handles, args.Length == 5 ? Number(args[4]) : null);
+                WriteNew(args[2], Encoding.UTF8.GetBytes(Data(template))); return 0;
+            }
+            case "--compare" when args.Length == 5:
+            case "--verify-enrollment" when args.Length == 5:
+            {
+                ulong probe = ImportData(File.ReadAllText(args[1]), handles), candidate = ImportData(File.ReadAllText(args[2]), handles);
+                object request = args[0] == "--compare" ? new { operation = "compare", probe, candidate, threshold = Number(args[3]) } : new { operation = "verify_enrollment", probe, enrollment = candidate, threshold = Number(args[3]) };
+                Console.WriteLine(Data(Recognize(args[4], request, handles))); return 0;
+            }
+            case "--enroll" when args.Length >= 6:
+            {
+                ulong[] samples = args.Skip(4).Select(path => ImportData(File.ReadAllText(path), handles)).ToArray();
+                ulong enrollment = Recognize(args[3], new { operation = "enroll", samples, threshold = Number(args[2]) }, handles);
+                WriteNew(args[1], Encoding.UTF8.GetBytes(Data(enrollment))); return 0;
+            }
+            case "--identify" when args.Length >= 5:
+            {
+                ulong probe = ImportData(File.ReadAllText(args[1]), handles);
+                ulong[] candidates = args.Skip(4).Select(path => ImportData(File.ReadAllText(path), handles)).ToArray();
+                Console.WriteLine(Data(Recognize(args[3], new { operation = "identify", probe, candidates, threshold = Number(args[2]), maximum = 10 }, handles))); return 0;
+            }
+            case "--export-template" when args.Length == 7:
+            {
+                ulong template = ImportData(File.ReadAllText(args[1]), handles);
+                ulong encoded = Recognize(args[6], new { operation = "export_template", template, format = args[3], quality = byte.Parse(args[4]), impression = byte.Parse(args[5]) }, handles);
+                using JsonDocument document = JsonDocument.Parse(Data(encoded)); WriteNew(args[2], document.RootElement.EnumerateArray().Select(p => p.GetByte()).ToArray()); return 0;
+            }
+            case "--import-template" when args.Length == 5:
+            {
+                ulong encoded = ImportData(JsonSerializer.Serialize(File.ReadAllBytes(args[1]).Select(b => (int)b)), handles);
+                ulong template = Recognize(args[4], new { operation = "import_template", data = encoded, format = args[3] }, handles);
+                WriteNew(args[2], Encoding.UTF8.GetBytes(Data(template))); return 0;
+            }
+            case "--wsq-encode" when args.Length is 5 or 6:
+            case "--wsq-decode" when args.Length == 5:
+            {
+                byte[] config = Json(new { encoder = Path.GetFullPath(args[3]), decoder = Path.GetFullPath(args[4]), bitrate = args.Length == 6 ? Number(args[5]) : 0.75, timeout_ms = 30_000 });
+                if (args[0] == "--wsq-encode")
+                {
+                    Native.Check(Native.uareu_image_encode_wsq(Load(args[1], handles), config, (nuint)config.Length, out ulong data)); handles.Data(data);
+                    using JsonDocument document = JsonDocument.Parse(Data(data)); WriteNew(args[2], document.RootElement.EnumerateArray().Select(p => p.GetByte()).ToArray());
+                }
+                else
+                {
+                    ulong data = ImportData(JsonSerializer.Serialize(File.ReadAllBytes(args[1]).Select(b => (int)b)), handles);
+                    Native.Check(Native.uareu_image_decode_wsq(data, config, (nuint)config.Length, out ulong image)); handles.Image(image); Save(image, args[2]);
+                }
+                return 0;
             }
             default: throw new ArgumentException("Invalid advanced command arguments; see README for usage.");
         }
@@ -84,7 +153,46 @@ internal static class Advanced
         using JsonDocument result = JsonDocument.Parse(Data(report));
         Require(result.RootElement.GetProperty("metadata").GetProperty("resolution").GetProperty("status").GetString() == "unknown", "Resolution was guessed.");
         Require(result.RootElement.GetProperty("quality").GetProperty("status").GetString() == "unsupported_input", "Unknown resolution must prevent NFIQ invocation.");
+        byte[] metadata = Json(new { resolution = new { status = "known", x_ppi = 500, y_ppi = 500, provenance = new { source = "caller_declared" } }, valid_region = (object?)null, processing = Array.Empty<string>() });
+        Native.Check(Native.uareu_image_from_pixels(32, 32, pixels, (nuint)pixels.Length, metadata, (nuint)metadata.Length, out ulong declared)); handles.Image(declared);
+        byte[] recordOptions = Json(new { capture_device_id = 0, acquisition_level = 0, scale_units = 1, scan_resolution_x = 500, scan_resolution_y = 500, finger_position = 0, quality = 0, impression = 0 });
+        Native.Check(Native.uareu_image_encode_record(declared, recordOptions, (nuint)recordOptions.Length, out ulong encoded)); handles.Data(encoded);
+        Native.Check(Native.uareu_image_decode_record(encoded, out ulong decoded)); handles.Image(decoded);
+        byte[] roundTrip = Native.ReadBytes((byte[]? buffer, nuint capacity, out nuint required) => Native.uareu_image_get_pixels(decoded, buffer, capacity, out required));
+        Require(roundTrip.SequenceEqual(pixels), "Raw ISO image-record conversion changed pixels.");
         Console.WriteLine("Managed enhancement, immutable reports, raw image import, and unknown-resolution gates verified.");
+    }
+    private static void RecognitionTest(string engine, Handles handles)
+    {
+        // Deterministic synthetic ridge field: no human fingerprint is used.
+        byte[] Pixels(int brightness) => Enumerable.Range(0, 256 * 256).Select(i => {
+            double x = i % 256 - 128, y = i / 256 - 128;
+            double phase = Math.Sqrt(x*x + y*y) * 0.7 + Math.Atan2(y, x) * 3 + Math.Sin(x / 18);
+            return (byte)Math.Clamp((Math.Cos(phase) > 0.15 ? 35 : 225) + brightness, 0, 255);
+        }).ToArray();
+        byte[] metadata = Json(new { resolution = new { status = "known", x_ppi = 500, y_ppi = 500, provenance = new { source = "caller_declared" } }, valid_region = (object?)null, processing = Array.Empty<string>() });
+        ulong Extract(int brightness)
+        {
+            byte[] pixels = Pixels(brightness); Native.Check(Native.uareu_image_from_pixels(256, 256, pixels, (nuint)pixels.Length, metadata, (nuint)metadata.Length, out ulong image)); handles.Image(image);
+            return Recognize(engine, new { operation = "extract", image }, handles);
+        }
+        ulong first = Extract(0), second = Extract(3);
+        ulong comparison = Recognize(engine, new { operation = "compare", probe = first, candidate = second, threshold = 1.0 }, handles);
+        using JsonDocument match = JsonDocument.Parse(Data(comparison));
+        Require(match.RootElement.GetProperty("matched").GetBoolean(), "Synthetic ridge-field variants did not match at integration-test threshold 1.");
+        ulong enrollment = Recognize(engine, new { operation = "enroll", samples = new[] { first, second }, threshold = 1.0 }, handles);
+        ulong verification = Recognize(engine, new { operation = "verify_enrollment", probe = first, enrollment, threshold = 1.0 }, handles);
+        using JsonDocument verified = JsonDocument.Parse(Data(verification)); Require(verified.RootElement.GetProperty("matched").GetBoolean(), "Enrollment verification failed.");
+        ulong identified = Recognize(engine, new { operation = "identify", probe = first, candidates = new[] { second }, threshold = 1.0, maximum = 1 }, handles);
+        using JsonDocument candidates = JsonDocument.Parse(Data(identified)); Require(candidates.RootElement.GetArrayLength() == 1, "Identification failed.");
+        foreach (string format in new[] { "iso19794_2_2005", "ansi378_2004" })
+        {
+            ulong encoded = Recognize(engine, new { operation = "export_template", template = first, format, quality = 0, impression = 0 }, handles);
+            ulong imported = Recognize(engine, new { operation = "import_template", data = encoded, format }, handles);
+            ulong compared = Recognize(engine, new { operation = "compare", probe = first, candidate = imported, threshold = 1.0 }, handles);
+            using JsonDocument result = JsonDocument.Parse(Data(compared)); Require(result.RootElement.GetProperty("matched").GetBoolean(), "Interchange round trip failed.");
+        }
+        Console.WriteLine("SourceAFIS extraction, comparison, enrollment, identification, and single-view ANSI/ISO conversion verified on synthetic data; no accuracy/FMR claim.");
     }
     private static void SessionTest()
     {

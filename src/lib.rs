@@ -3,10 +3,14 @@
 pub mod error;
 pub mod ffi;
 pub mod frame;
+pub mod image_record;
 pub mod metadata;
 pub mod processing;
 pub mod protocol;
 pub mod quality;
 pub mod reader;
+pub mod recognition;
 pub mod task;
+pub mod template_io;
 pub mod usb;
+pub mod wsq;

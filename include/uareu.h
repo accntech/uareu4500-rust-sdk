@@ -193,6 +193,34 @@ UAREU_API uareu_status UAREU_CALL uareu_data_get_json(uareu_handle data, uint8_t
 UAREU_API uareu_status UAREU_CALL uareu_data_free(uareu_handle data);
 UAREU_API uareu_status UAREU_CALL uareu_data_from_json(const uint8_t *input, size_t length, uareu_handle *data);
 UAREU_API uareu_status UAREU_CALL uareu_image_from_pixels(uint32_t width, uint32_t height, const uint8_t *pixels, size_t length, const uint8_t *metadata, size_t metadata_length, uareu_handle *image);
+/* Optional external NBIS tools. Config: encoder, decoder, timeout_ms, bitrate.
+ * Encoding requires explicit 500 PPI. Data is a JSON byte array handle.
+ * Decode preserves NISTCOM declared scale, not proof of calibration.
+ * WSQ is lossy; no FBI encoder certification is claimed. */
+UAREU_API uareu_status UAREU_CALL uareu_image_encode_wsq(uareu_handle image, const uint8_t *config, size_t length, uareu_handle *data);
+UAREU_API uareu_status UAREU_CALL uareu_image_decode_wsq(uareu_handle data, const uint8_t *config, size_t length, uareu_handle *image);
+/* Single-view ISO 19794-4:2005 FIR/010 raw 8-bit subset. Config requires explicit
+ * capture_device_id, acquisition_level, scale_units (1=PPI,2=PPCM),
+ * scan_resolution_x/y, finger_position, quality, impression. Source image
+ * resolution must be known and representable. No scan scale/quality/default
+ * certification is guessed. Data handles contain JSON byte arrays. */
+UAREU_API uareu_status UAREU_CALL uareu_image_encode_record(uareu_handle image, const uint8_t *config, size_t length, uareu_handle *data);
+UAREU_API uareu_status UAREU_CALL uareu_image_decode_record(uareu_handle data, uareu_handle *image);
+/* Optional local SourceAFIS helper config: executable, timeout_ms, optional
+ * explicit ppi for extraction. Requests use operation:
+ * extract {image}; compare {probe,candidate,threshold}; identify
+ * {probe,candidates:[handles],threshold,maximum}; enroll {samples:[handles],
+ * threshold}; verify_enrollment {probe,enrollment,threshold}; export_template
+ * {template,format,quality,impression}; import_template {data,format}.
+ * iso19794_2_2005/ansi378_2004 support one view/no extensions only. Quality and
+ * impression are explicit caller declarations. Import data is a data handle
+ * holding the binary template as a JSON byte array.
+ * Templates/enrollment/results are owned JSON data handles. Input handles are
+ * borrowed. Positive finite thresholds are mandatory, application-calibrated.
+ * Multi-template enrollment is not vendor fusion. Scores/format are NOT vendor
+ * scores. Native caches are version bound; ANSI/ISO conversions are limited
+ * and quantize coordinates/angles. Engine build identity is recorded/checked. */
+UAREU_API uareu_status UAREU_CALL uareu_recognition_execute(const uint8_t *config, size_t config_length, const uint8_t *request, size_t request_length, uareu_handle *output);
 
 #ifdef __cplusplus
 }
