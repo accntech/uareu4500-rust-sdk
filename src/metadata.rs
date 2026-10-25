@@ -94,6 +94,7 @@ pub enum ProcessingStep {
     DescriptorExpansion,
     IntensityInversion,
     Rotate180,
+    ContrastStretch { lower: u8, upper: u8 },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -1044,6 +1044,60 @@ pub unsafe extern "C" fn uareu_data_from_json(
         unsafe { write(output, id) }
     })
 }
+/// Copy raw grayscale pixels and explicit metadata into a new image.
+/// # Safety
+/// All byte ranges must be valid, and output must point to writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_from_pixels(
+    width: u32,
+    height: u32,
+    pixels: *const u8,
+    length: usize,
+    metadata: *const u8,
+    metadata_len: usize,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        if metadata_len > 16_384
+            || width == 0
+            || height == 0
+            || length > 16 * 1024 * 1024
+            || pixels.is_null()
+            || (width as usize).checked_mul(height as usize) != Some(length)
+        {
+            return Err(error(INVALID_ARGUMENT, "invalid pixel geometry"));
+        }
+        let image = crate::frame::Image {
+            width: width as usize,
+            height: height as usize,
+            pixels: unsafe { std::slice::from_raw_parts(pixels, length) }.to_vec(),
+        };
+        let metadata = if metadata_len == 0 {
+            crate::metadata::CaptureMetadata::default()
+        } else {
+            unsafe { json_input(metadata, metadata_len)? }
+        };
+        let captured = CapturedImage { image, metadata };
+        captured
+            .metadata
+            .validate(&captured.image)
+            .map_err(|e| mapped(INVALID_ARGUMENT, e))?;
+        let id = register_image(captured)?;
+        unsafe { write(output, id) }
+    })
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssessmentOptions {
+    engine_path: Option<std::path::PathBuf>,
+    model_path: Option<std::path::PathBuf>,
+    timeout_ms: Option<u64>,
+    ppi: Option<f64>,
+}
 unsafe fn json_input<T: serde::de::DeserializeOwned>(input: *const u8, length: usize) -> Result<T> {
     if input.is_null() || length == 0 || length > 16 * 1024 * 1024 {
         return Err(error(INVALID_ARGUMENT, "invalid JSON input size/pointer"));
@@ -1055,6 +1109,57 @@ fn data(value: &impl serde::Serialize) -> Result<u64> {
     let bytes = serde_json::to_vec(value).map_err(|e| error(INTERNAL_ERROR, e.to_string()))?;
     insert(Object::Data(Arc::new(bytes)))
 }
+/// Evaluate once and return an immutable report handle (so probing never reruns an engine).
+/// # Safety
+/// JSON must be readable for length bytes and output writable for a u64.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_assess(
+    handle: u64,
+    config: *const u8,
+    length: usize,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let options: AssessmentOptions = unsafe { json_input(config, length)? };
+        let mut captured = image(handle)?.captured.clone();
+        if let Some(ppi) = options.ppi {
+            captured.metadata.resolution = crate::metadata::Resolution::declared(ppi, ppi)
+                .map_err(|e| mapped(INVALID_ARGUMENT, e))?;
+        }
+        let timeout = options.timeout_ms.unwrap_or(10_000);
+        if !(1..=300_000).contains(&timeout) {
+            return Err(error(INVALID_ARGUMENT, "engine timeout out of range"));
+        }
+        let engine = options.engine_path.map(|executable| quality::Nfiq2 {
+            executable,
+            model_info: options.model_path,
+            timeout: Duration::from_millis(timeout),
+        });
+        let report =
+            quality::assess(&captured, engine.as_ref()).map_err(|e| mapped(IMAGE_ERROR, e))?;
+        let handle = data(&report)?;
+        unsafe { write(output, handle) }
+    })
+}
+/// Explicit display enhancement creates a new image and preserves the original.
+/// # Safety
+/// output must point to writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_enhance(handle: u64, output: *mut u64) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let enhanced = crate::processing::enhance(&image(handle)?.captured)
+            .map_err(|e| mapped(IMAGE_ERROR, e))?;
+        let id = register_image(enhanced)?;
+        unsafe { write(output, id) }
+    })
+}
+
 /// Capture with the same phase notifications used by the CLI.
 /// # Safety
 /// `output` follows `uareu_capture`; callback/context must remain valid until

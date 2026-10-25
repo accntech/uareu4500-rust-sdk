@@ -4,6 +4,7 @@ pub mod error;
 pub mod ffi;
 pub mod frame;
 pub mod metadata;
+pub mod processing;
 pub mod protocol;
 pub mod quality;
 pub mod reader;

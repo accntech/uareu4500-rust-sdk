@@ -5,7 +5,7 @@ using System.Text.Json;
 
 internal static class Advanced
 {
-    internal static readonly HashSet<string> Commands = ["--async-test", "--capture-async", "--continuous", "--probe", "--recover", "--session-test"];
+    internal static readonly HashSet<string> Commands = ["--advanced-test", "--async-test", "--capture-async", "--continuous", "--enhance", "--probe", "--quality", "--recover", "--session-test"];
     private sealed class Handles : IDisposable
     {
         private readonly List<(ulong Value, bool Image)> items = [];
@@ -42,6 +42,7 @@ internal static class Advanced
         using Handles handles = new();
         switch (args[0])
         {
+            case "--advanced-test": OfflineTest(handles); return 0;
             case "--session-test": SessionTest(); return 0;
             case "--probe":
             case "--recover":
@@ -58,8 +59,32 @@ internal static class Advanced
             case "--async-test": await AsyncCapture(null, true); return 0;
             case "--capture-async" when args.Length == 2: await AsyncCapture(args[1], false); return 0;
             case "--continuous" when args.Length == 2: Continuous(args[1]); return 0;
+            case "--quality" when args.Length is 2 or 3:
+            {
+                ulong image = Load(args[1], handles);
+                byte[] config = Json(new { engine_path = args.Length == 3 ? Path.GetFullPath(args[2]) : null as string });
+                Native.Check(Native.uareu_image_assess(image, config, (nuint)config.Length, out ulong report)); handles.Data(report); Console.WriteLine(Data(report)); return 0;
+            }
+            case "--enhance" when args.Length == 3:
+            {
+                Native.Check(Native.uareu_image_enhance(Load(args[1], handles), out ulong image)); handles.Image(image); Save(image, args[2]); return 0;
+            }
             default: throw new ArgumentException("Invalid advanced command arguments; see README for usage.");
         }
+    }
+    private static void OfflineTest(Handles handles)
+    {
+        byte[] pixels = Enumerable.Range(0, 1024).Select(i => (byte)(200 + i % 50)).ToArray();
+        Native.Check(Native.uareu_image_from_pixels(32, 32, pixels, (nuint)pixels.Length, null, 0, out ulong original)); handles.Image(original);
+        Native.Check(Native.uareu_image_enhance(original, out ulong enhanced)); handles.Image(enhanced);
+        byte[] copy = Native.ReadBytes((byte[]? buffer, nuint capacity, out nuint required) => Native.uareu_image_get_pixels(original, buffer, capacity, out required));
+        Require(copy.SequenceEqual(pixels), "Enhancement changed original pixels.");
+        byte[] config = Json(new { engine_path = "absent-engine" });
+        Native.Check(Native.uareu_image_assess(original, config, (nuint)config.Length, out ulong report)); handles.Data(report);
+        using JsonDocument result = JsonDocument.Parse(Data(report));
+        Require(result.RootElement.GetProperty("metadata").GetProperty("resolution").GetProperty("status").GetString() == "unknown", "Resolution was guessed.");
+        Require(result.RootElement.GetProperty("quality").GetProperty("status").GetString() == "unsupported_input", "Unknown resolution must prevent NFIQ invocation.");
+        Console.WriteLine("Managed enhancement, immutable reports, raw image import, and unknown-resolution gates verified.");
     }
     private static void SessionTest()
     {

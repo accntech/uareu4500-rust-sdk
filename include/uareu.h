@@ -181,9 +181,18 @@ UAREU_API uareu_status UAREU_CALL uareu_image_get_report_json(uareu_handle image
 UAREU_API uareu_status UAREU_CALL uareu_image_save_png(uareu_handle image, const uint8_t *path, size_t path_length);
 UAREU_API uareu_status UAREU_CALL uareu_image_load_png(const uint8_t *path, size_t path_length, uareu_handle *output);
 UAREU_API uareu_status UAREU_CALL uareu_image_free(uareu_handle image);
+/* JSON assessment config: engine_path/model_path optional, timeout_ms 1..300000,
+ * ppi optional EXPLICIT caller declaration. No declaration means retain source
+ * metadata. Engine executes once; output data handle owns immutable JSON.
+ * Unknown resolution returns a report with unsupported_input, never guessed DPI. */
+UAREU_API uareu_status UAREU_CALL uareu_image_assess(uareu_handle image, const uint8_t *config, size_t length, uareu_handle *report);
+/* Display-only percentile contrast stretch. Creates new image/provenance;
+ * original pixels stay intact. Not vendor enhancement, PIV, or dewarping. */
+UAREU_API uareu_status UAREU_CALL uareu_image_enhance(uareu_handle image, uareu_handle *output);
 UAREU_API uareu_status UAREU_CALL uareu_data_get_json(uareu_handle data, uint8_t *buffer, size_t capacity, size_t *required);
 UAREU_API uareu_status UAREU_CALL uareu_data_free(uareu_handle data);
 UAREU_API uareu_status UAREU_CALL uareu_data_from_json(const uint8_t *input, size_t length, uareu_handle *data);
+UAREU_API uareu_status UAREU_CALL uareu_image_from_pixels(uint32_t width, uint32_t height, const uint8_t *pixels, size_t length, const uint8_t *metadata, size_t metadata_length, uareu_handle *image);
 
 #ifdef __cplusplus
 }

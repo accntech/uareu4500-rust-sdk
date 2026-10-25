@@ -115,6 +115,7 @@ pub struct QualityReport {
     pub metadata: CaptureMetadata,
     pub diagnostics: ImageDiagnostics,
     pub quality: QualityOutcome,
+    pub feedback: crate::processing::ImageFeedback,
 }
 
 pub fn assess(captured: &CapturedImage, engine: Option<&Nfiq2>) -> Result<QualityReport> {
@@ -128,5 +129,6 @@ pub fn assess(captured: &CapturedImage, engine: Option<&Nfiq2>) -> Result<Qualit
         quality: engine.map_or(QualityOutcome::NotEvaluated, |engine| {
             engine.assess(captured)
         }),
+        feedback: crate::processing::feedback(captured)?,
     })
 }
