@@ -33,6 +33,29 @@ fn parse(path: &Path) -> Result<toml::Value> {
         )
     })
 }
+fn write_vendor_config(root: &Path) -> Result<()> {
+    let path = root.join(".cargo/config.toml");
+    let mut config = if path.exists() {
+        parse(&path)?
+    } else {
+        toml::from_str(VENDOR_CONFIG)?
+    };
+    let vendor: toml::Value = toml::from_str(VENDOR_CONFIG)?;
+    for section in ["source", "net"] {
+        let table = config
+            .as_table_mut()
+            .context("Cargo configuration must be a TOML table")?
+            .entry(section)
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .with_context(|| format!("Cargo configuration {section} must be a table"))?;
+        for (key, value) in vendor[section].as_table().unwrap() {
+            table.insert(key.clone(), value.clone());
+        }
+    }
+    fs::write(path, toml::to_string(&config)?)?;
+    Ok(())
+}
 fn relative(path: &Path, root: &Path) -> Result<String> {
     Ok(path
         .strip_prefix(root)?
@@ -74,7 +97,7 @@ fn project_paths(root: &Path, vendor: bool) -> Result<BTreeMap<String, PathBuf>>
         ("include", &["h"][..]),
         ("examples", &["c", "cs", "csproj"][..]),
         ("tests", &["rs", "c"][..]),
-        ("scripts", &["ps1"][..]),
+        ("scripts", &["ps1", "py"][..]),
         ("xtask/src", &["rs"][..]),
         ("fixtures", &["wire", "gray"][..]),
         ("udev", &["rules"][..]),
@@ -593,7 +616,7 @@ pub fn run(root: &Path, target: &str, output_dir: &Path) -> Result<()> {
         .context("locked vendoring failed; run cargo fetch --locked and retry")?;
     }
     fs::create_dir_all(snapshot.join(".cargo"))?;
-    fs::write(snapshot.join(".cargo/config.toml"), VENDOR_CONFIG)?;
+    write_vendor_config(&snapshot)?;
     validate_vendor(&snapshot)?;
     let metadata = parse(&snapshot.join("Cargo.toml"))?;
     let name = metadata["package"]["name"]
@@ -868,6 +891,38 @@ mod tests {
         );
     }
     #[test]
+    fn vendoring_preserves_target_flags_aliases_and_network_settings() {
+        let f = fixture();
+        let original = r#"
+[target.'cfg(target_os = "macos")']
+rustflags = ['-C', 'strip=none']
+[target.x86_64-pc-windows-msvc]
+linker = 'lld-link'
+[alias]
+verify = 'test --locked'
+[net]
+offline = false
+retry = 7
+[source.crates-io]
+replace-with = 'old-vendor'
+[source.old-vendor]
+directory = 'legacy-vendor'
+"#;
+        write(&f.root, ".cargo/config.toml", original);
+        let before = parse(&f.root.join(".cargo/config.toml")).unwrap();
+        write_vendor_config(&f.root).unwrap();
+        let after = parse(&f.root.join(".cargo/config.toml")).unwrap();
+        assert_eq!(after.get("target"), before.get("target"));
+        assert_eq!(after.get("alias"), before.get("alias"));
+        assert_eq!(after["net"]["offline"].as_bool(), Some(true));
+        assert_eq!(after["net"]["retry"], before["net"]["retry"]);
+        assert_eq!(
+            after["source"]["old-vendor"],
+            before["source"]["old-vendor"]
+        );
+        validate_vendor(&f.root).unwrap();
+    }
+    #[test]
     fn snapshot_allowlist_excludes_python_private_and_generated_inputs() {
         let f = fixture();
         for name in [
@@ -893,6 +948,7 @@ mod tests {
             "examples/csharp/UareuExample.csproj",
             "tests/c/abi_smoke.c",
             "scripts/test-windows-dll.ps1",
+            "scripts/test-macos-dylib.py",
             "examples/engine/UareuEngine.csproj",
             "examples/engine/Program.cs",
             "examples/engine/packages.lock.json",

@@ -1,2 +1,8 @@
 [alias]
 xtask = "run --locked --package xtask --"
+
+# Rust/LLVM's Mach-O debug stripping can misalign the LINKEDIT string pool,
+# rejected by macOS 27 dyld (rust-lang/rust#157750, llvm/llvm-project#203678).
+# Preserve symbols on macOS; never patch the linked binary or relax its loader.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "strip=none"]
