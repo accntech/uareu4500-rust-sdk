@@ -1,7 +1,7 @@
 # UareU 4500 Rust SDK
 
 Experimental Rust library and command-line tool for U.are.U 4500 USB image
-capture on Linux and macOS. Licensed **GPL-3.0-or-later**; see [LICENSE](LICENSE)
+capture on Windows, Linux, and macOS. Licensed **GPL-3.0-or-later**; see [LICENSE](LICENSE)
 and [NOTICE](NOTICE) for the grant, attribution, and upstream license origin.
 
 Targets USB **05ba:000a**, shared by 4000B/4500 readers. Device behavior and timing
@@ -12,8 +12,9 @@ captures images, not enrollment templates, matches, or liveness assessments.
 ## Build and use
 
 Requires stable Rust 1.85+ and a USB-connected reader. Project tooling also runs
-in Rust through `cargo xtask`; Python is not required. No Windows SDK or custom
-kernel driver is installed.
+in Rust through `cargo xtask`; Python is not required. The application does not
+install a custom kernel driver. Windows requires the reader to be associated with
+Microsoft's built-in WinUSB driver; see [Windows USB setup](#windows-usb-setup).
 
 ```sh
 cargo build --locked --release
@@ -47,6 +48,47 @@ open/configure/close operations. In continuous mode, `--timeout` bounds startup
 and each image acquisition; waiting for finger placement or removal can remain
 idle until Ctrl-C. Cleanup has an additional bounded allowance. Single captures
 consume the reader; continuous mode keeps one reader open for the scan sequence.
+
+### Windows USB setup
+
+The `nusb` backend uses WinUSB on Windows. Building or copying the executable
+does not assign this driver to the reader: each Windows PC needs an initial
+driver setup with administrator approval. Installing WinUSB allows this SDK to
+communicate with the reader; fingerprint capture remains in the Rust application.
+
+1. Connect the reader and download [Zadig](https://zadig.akeo.ie/) from its
+   official site. Verify that the executable's digital signature is valid and
+   identifies **Akeo Consulting**, then run it as administrator.
+2. Select the fingerprint reader. It may appear as **Biokey 200 Fingerprint
+   Scanner**. Confirm the **USB ID is `05BA:000A`** before installing anything.
+   If it is missing from the list, enable **Options > List All Devices**.
+3. Select **WinUSB** as the target driver and click **Install Driver** (or
+   **Replace Driver** if another driver is assigned). Replacing a manufacturer's
+   driver may prevent its software from using the reader until that driver is
+   restored. Do not select a keyboard, mouse, or USB hub.
+4. Wait for installation to finish, then verify detection and start scanning:
+
+   ```powershell
+   cargo build --locked --release
+   .\target\release\uareu4500.exe list
+   .\target\release\uareu4500.exe capture --continuous --output-dir captures
+   ```
+
+Place a finger when prompted, then lift and replace it between captures. Press
+Ctrl-C to stop. Once WinUSB is assigned, subsequent runs normally need no
+administrator approval; moving the executable to a fresh PC still requires the
+driver setup there.
+
+If Device Manager shows the reader with **Code 28**, Windows has no driver
+installed for it. The CLI may report no compatible reader even though Device
+Manager shows `USB\VID_05BA&PID_000A`. Assign WinUSB using the steps above and
+retry `list`; reconnect the reader if necessary. `list --all` alone cannot rule
+out a connected reader whose Windows driver is missing or incompatible.
+
+See Microsoft's [WinUSB installation documentation](https://learn.microsoft.com/en-us/windows-hardware/drivers/usbcon/winusb-installation)
+and [Code 28 explanation](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/cm-prob-failed-install).
+
+### Linux and macOS USB setup
 
 On Linux, install the reader-scoped active-session rule, then reconnect:
 

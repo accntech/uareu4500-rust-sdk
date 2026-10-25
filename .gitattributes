@@ -1,2 +1,4 @@
 fixtures/*.wire binary
 fixtures/*.gray binary
+# License policy hashes exact upstream bytes on every platform.
+licenses/supplements/* text eol=lf
