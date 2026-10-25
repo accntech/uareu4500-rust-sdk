@@ -1,0 +1,22 @@
+name: Rust
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fetch --locked
+      - run: cargo xtask notices
+      - run: cargo xtask notices --check
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo xtask fixtures --check
+      - run: cargo test --locked --workspace --all-targets
+      - run: cargo test --locked --workspace --doc
+      - run: cargo build --locked --release

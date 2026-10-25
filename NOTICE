@@ -1,0 +1,49 @@
+UareU 4500 Rust SDK — GPL-3.0-or-later
+Copyright (c) 2026 UareU 4500 Rust SDK contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See LICENSE for the full GNU General Public License.
+
+Device protocol origin and upstream attribution
+----------------------------------------------
+Digital Persona U.are.U 4000/4000B/4500 driver for libfprint:
+Copyright (C) 2007-2008 Daniel Drake <dsd@gentoo.org>
+Copyright (C) 2012 Timo Teräs <timo.teras@iki.fi>
+
+Reference: libfprint/libfprint, commit
+6f9479c3d55f847c1b3769f28ceb99227f9858cf, libfprint/drivers/uru4000.c
+https://gitlab.freedesktop.org/libfprint/libfprint/-/blob/6f9479c3d55f847c1b3769f28ceb99227f9858cf/libfprint/drivers/uru4000.c
+
+That reference is licensed LGPL-2.1-or-later. To the extent this distributed
+implementation includes material covered by that grant, distribution exercises
+the conversion option in LGPL 2.1 section 3 and applies GPL-3.0-or-later to this
+copy. This does not change the upstream project's license or imply endorsement.
+The upstream copyright and provenance are preserved without claiming that a
+legal finding of derivation or independence has been made.
+
+Changes: 2026-10-25, UareU 4500 Rust SDK contributors. Rust user-space implementation,
+validated frame layout and decoding, bounded session lifecycle, cancellation,
+phase-specific event handling, Linux/macOS USB transport, CLI, synthetic tests,
+and source-inclusive release packaging. The project was previously offered as
+an MIT-target replacement after prior examination of libfprint. No formal
+clean-room or legal clearance was established. This GPL release does not withdraw
+any valid MIT permissions already granted over independently owned earlier copies.
+
+Third-party dependencies and generated data
+------------------------------------------
+Dependency source and notice texts retain their own copyright and license grants;
+the project license does not replace them. Release archives carry the collected
+third-party notices, the Rust standard-library notice report, and matching source
+with the locked Cargo dependencies and build scripts. Some dependencies provide
+only licensing statements/author metadata; these are preserved without inventing
+copyright ownership notices. This collection is not a certification of SDK,
+patent, or other underlying rights.
+
+Test fixtures are generated locally by xtask/src/fixtures.rs from deterministic
+non-biometric patterns. No upstream capture/image, vendor DLL, firmware image,
+Windows driver binary, or proprietary SDK source is included in the project.

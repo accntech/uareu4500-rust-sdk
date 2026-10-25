@@ -1,0 +1,61 @@
+name: Release packages
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rust-docs
+      - run: cargo fetch --locked
+      - run: cargo xtask notices
+      - run: cargo xtask notices --check
+      - run: cargo xtask fixtures --check
+      - run: cargo test --locked --all --workspace
+      - run: cargo xtask package --target ${{ matrix.target }}
+      - name: Verify extracted source offline
+        shell: bash
+        env:
+          PACKAGE_TARGET: ${{ matrix.target }}
+        run: |
+          extracted="$(mktemp -d)"
+          archives=(dist/*-"${PACKAGE_TARGET}".tar.gz)
+          test "${#archives[@]}" -eq 1
+          archive="${archives[0]}"
+          package="$(basename "$archive" .tar.gz)"
+          tar -xzf "$archive" -C "$extracted"
+          cd "$extracted/$package/source"
+          export CARGO_HOME="$RUNNER_TEMP/offline-cargo"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/offline-target"
+          mkdir -p "$CARGO_HOME"
+          ./REBUILD.sh
+          cargo xtask fixtures --check
+          cargo xtask notices --target "$PACKAGE_TARGET"
+          cargo xtask notices --target "$PACKAGE_TARGET" --check
+          cargo test --frozen --all --workspace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UareU 4500 Rust SDK-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error

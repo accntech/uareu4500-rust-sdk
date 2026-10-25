@@ -1,0 +1,3 @@
+# Local, active desktop sessions only; do not grant world-readable biometric access.
+# Tag before 73-seat-late.rules processes uaccess ACLs.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="05ba", ATTR{idProduct}=="000a", TAG+="uaccess"

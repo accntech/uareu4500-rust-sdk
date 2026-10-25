@@ -1,0 +1,11 @@
+/target/
+/captures/
+*.png
+*.pgm
+.DS_Store
+
+/dist/
+
+# Keep the workspace command alias despite global Cargo ignores.
+!/.cargo/
+!/.cargo/config.toml
