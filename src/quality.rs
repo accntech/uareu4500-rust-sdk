@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Advisory diagnostics and optional NFIQ 2 evaluation, independent of USB I/O.
+mod nfiq1;
 mod nfiq2;
+pub use nfiq1::{LegacyNfiqOutcome, Nfiq1};
 pub use nfiq2::Nfiq2;
 
 use crate::metadata::{CaptureMetadata, CapturedImage, Region};

@@ -9,6 +9,10 @@ use crate::frame::Image;
 use crate::metadata::CapturedImage;
 use std::{sync::atomic::AtomicBool, time::Duration};
 pub trait Transport {
+    /// Retain an already validated initialization register-f0 read. This hook
+    /// performs no extra register request and does not classify firmware/hardware.
+    /// Existing transports may ignore the optional observation.
+    fn identity_observed(&mut self, _raw: [u8; 16]) {}
     fn read_registers(
         &mut self,
         register: u16,
@@ -236,7 +240,11 @@ impl<T: Transport> Session<'_, T> {
         self.notify(CaptureEvent::Initializing, callback)?;
         self.active = true;
         self.power_up()?;
-        self.read(0xf0, 16)?;
+        let bytes = self.read(0xf0, 16)?;
+        let mut raw = [0; 16];
+        raw.copy_from_slice(&bytes);
+        self.io.identity_observed(raw);
+        self.check()?;
         Ok(())
     }
     fn wait_for_finger(

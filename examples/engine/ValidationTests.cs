@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 using System.Formats.Cbor;
 using System.Text.Json;
+using SourceAFIS;
 
 internal static class ValidationTests
 {
@@ -32,6 +33,18 @@ internal static class ValidationTests
         writer.WriteTextString("height"); writer.WriteInt32(32);
         writer.WriteEndMap();
         Rejected(() => NativeTemplate.Read(writer.Encode()));
-        Console.WriteLine("Native template bounds, required fields, and invalid direction checks verified.");
+        byte[] cache = Record(31, 31, 0);
+        FingerprintTemplate Parse(JsonElement value) => new(value.EnumerateArray().Select(b => b.GetByte()).ToArray());
+        using JsonDocument comparison = JsonDocument.Parse(JsonSerializer.Serialize(new { probe = cache.Select(b => (int)b), candidate = cache.Select(b => (int)b), additional_candidates = new[] { cache.Select(b => (int)b).ToArray(), cache.Select(b => (int)b).ToArray() } }));
+        using JsonDocument compared = JsonDocument.Parse(JsonSerializer.Serialize(ComparisonRequest.Run(comparison.RootElement, Parse)));
+        if (compared.RootElement.GetProperty("additional_scores").GetArrayLength() != 2 ||
+            compared.RootElement.GetProperty("additional_scores")[0].GetDouble() != compared.RootElement.GetProperty("score").GetDouble())
+            throw new InvalidOperationException("Batched scores differ from the first identical comparison.");
+        using JsonDocument legacy = JsonDocument.Parse(JsonSerializer.Serialize(new { probe = cache.Select(b => (int)b), candidate = cache.Select(b => (int)b) }));
+        using JsonDocument legacyResponse = JsonDocument.Parse(JsonSerializer.Serialize(ComparisonRequest.Run(legacy.RootElement, Parse)));
+        if (legacyResponse.RootElement.TryGetProperty("additional_scores", out _)) throw new InvalidOperationException("Legacy response changed.");
+        using JsonDocument malformedBatch = JsonDocument.Parse(JsonSerializer.Serialize(new { probe = cache.Select(b => (int)b), candidate = cache.Select(b => (int)b), additional_candidates = "invalid" }));
+        Rejected(() => ComparisonRequest.Run(malformedBatch.RootElement, Parse));
+        Console.WriteLine("Native template validation and additive batch comparison verified.");
     }
 }

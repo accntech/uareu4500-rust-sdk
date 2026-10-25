@@ -112,14 +112,35 @@ UAREU_API uareu_status UAREU_CALL uareu_reader_get_capabilities_json(uareu_handl
  * JSON schema 1: source, sequence, operation, capture_active, interface_claimed,
  * finger_present, hardware_ready, calibration_required, connected, last_outcome;
  * DLL additionally exposes busy (capture lease) and cancellation_requested.
- * sequence is a local observation counter. Hardware readiness, connectivity,
- * calibration remain null. Finger presence is only a cached true observation
+ * sequence is a local observation counter. Hardware readiness and
+ * calibration remain null; connectivity can reflect an OS USB hotplug event.
+ * Finger presence is only a cached true observation
  * during acquisition; idle/initializing/waiting/finished states return null.
  * Completed capture does not imply biometric quality. Closed/stale handles fail.
  * Snapshots can change between buffer probes; retry BUFFER_TOO_SMALL and use
  * the actual required count after success (the JSON may also shrink).
  */
 UAREU_API uareu_status UAREU_CALL uareu_reader_get_status_json(uareu_handle reader, uint8_t *buffer, size_t capacity, size_t *required);
+/* Cached observation wait, no USB polling. timeout_ms 0..300000; sequence is
+ * local to this reader (from get_status_json or an earlier wait). Returns OK,
+ * completed=0/data=0 on timeout; OK/completed=1 with an owned immutable JSON
+ * ReaderStatus snapshot on a newer sequence. No ReaderState lock is held while
+ * waiting; closing wakes in-progress waits, which can return operation=closed.
+ * New calls on a closed/stale handle return INVALID_HANDLE. Free data once.
+ * Snapshot schema: {schema_version:u32,source:string,sequence:u64,
+ * operation:string,capture_active:bool,interface_claimed:bool,
+ * finger_present:bool|null,hardware_ready:bool|null,
+ * calibration_required:bool|null,connected:bool|null,
+ * last_outcome:{success:bool,failure:CaptureFailure|null}|null,
+ * last_hardware_observation:{source:string,observed_unix_ms:u64|null,
+ * connected_at_observation:bool,hardware_status_register:u8,low_power:bool,
+ * hardware_ready:bool|null,calibration_required:bool|null}|null,
+ * last_probe_failure:CaptureFailure|null,hotplug_monitoring:bool}.
+ * CaptureFailure={kind:string,stage:string|null,message:string,
+ * cleanup:CaptureFailure|null}, recursively, as in last_error_json.
+ * This immutable snapshot excludes get_status_json's added busy,
+ * persistent_session, cancellation_requested fields. Outputs zero on failure. */
+UAREU_API uareu_status UAREU_CALL uareu_reader_wait_status_json(uareu_handle reader, uint64_t after_sequence, uint32_t timeout_ms, uint32_t *completed, uareu_handle *data);
 /* Explicit bounded status-register observation: timestamp, raw register and
  * low-power flag. Readiness/calibration/DPI remain unknown. Requires idle
  * reader; concurrent capture returns BUSY. Output is an owned data handle. */
@@ -163,6 +184,20 @@ UAREU_API uareu_status UAREU_CALL uareu_capture_continuous(uareu_handle reader, 
  * once. Free cancels AND JOINS worker; free every job before unloading DLL.
  * Task cancellation and reader cancellation target the same operation. */
 UAREU_API uareu_status UAREU_CALL uareu_capture_start(uareu_handle reader, uint32_t timeout_ms, uint32_t rotate180, uareu_handle *task);
+/* Alternative async completion delivery on the capture worker, exactly once
+ * after acquisition/cleanup. A successful start publishes *task before enabling
+ * delivery; callback can run before start returns. Failed start never delivers.
+ * Callback owns image on OK, or a JSON error-report data handle on failure
+ * (report may be zero if allocation fails). Free each with matching image/data
+ * API. No SDK lock is held across the callback. Do not unwind or unload DLL.
+ * Result is consumed by callback delivery; task_wait cannot consume it again.
+ * Poll task status/cancel remain available. Free joins callback completion;
+ * deadlines do not bound callback code. Free from its own callback returns BUSY
+ * without removing the task; free it from another thread after delivery.
+ * Keep callback/context valid until task_free returns. This is our cdecl ABI,
+ * not a vendor DPFPDD callback struct or __stdcall compatibility alias. */
+typedef void (UAREU_CALL *uareu_completion_callback)(uareu_status status, uareu_handle image, uareu_handle error_report, void *context);
+UAREU_API uareu_status UAREU_CALL uareu_capture_start_with_completion(uareu_handle reader, uint32_t timeout_ms, uint32_t rotate180, uareu_completion_callback callback, void *context, uareu_handle *task);
 UAREU_API uareu_status UAREU_CALL uareu_task_wait(uareu_handle task, uint32_t timeout_ms, uareu_handle *image, uint32_t *completed);
 UAREU_API uareu_status UAREU_CALL uareu_task_cancel(uareu_handle task);
 UAREU_API uareu_status UAREU_CALL uareu_task_get_status_json(uareu_handle task, uint8_t *buffer, size_t capacity, size_t *required);
@@ -199,6 +234,115 @@ UAREU_API uareu_status UAREU_CALL uareu_image_from_pixels(uint32_t width, uint32
  * WSQ is lossy; no FBI encoder certification is claimed. */
 UAREU_API uareu_status UAREU_CALL uareu_image_encode_wsq(uareu_handle image, const uint8_t *config, size_t length, uareu_handle *data);
 UAREU_API uareu_status UAREU_CALL uareu_image_decode_wsq(uareu_handle data, const uint8_t *config, size_t length, uareu_handle *image);
+/* Score one zero-based image in a MultiImageRecord JSON data handle. Config:
+ * optional engine_path/model_path, timeout_ms 1..300000 (default 10000).
+ * ppi overrides are rejected: resolution comes from the record declaration.
+ * Opaque compression, invalid index, or invalid declarations return an owned
+ * {status:"unsupported_input",reason:string} outcome, without codec execution.
+ * No engine gives {status:"not_evaluated"} for a valid raw view.
+ * Other outcome JSON statuses: engine_unavailable/evaluation_failed with reason,
+ * or {status:"scored",engine:{name:string,version:string,
+ * executable_sha256:string,model_source:string,model_info_sha256:string|null,
+ * model_data_sha256:string|null},score:u8 (0..100),input_region:{x:size_t,
+ * y:size_t,width:size_t,height:size_t},evaluation_ppi:u32,
+ * actionable_feedback:{string:number}}.
+ * Outcome status must be checked even when the ABI function returns OK.
+ * Inputs borrowed; output owned, freed with uareu_data_free; zero on failure. */
+UAREU_API uareu_status UAREU_CALL uareu_image_assess_record_view(uareu_handle record, size_t view, const uint8_t *config, size_t length, uareu_handle *result);
+
+/* Measured WSQ target search. Config JSON: {encoder:string,decoder:string,
+ * target_bytes:1..4194304,max_encodes?:1..32 (default 8),
+ * timeout_ms?:1..300000 (default 30000; shared search/per-process budget)}.
+ * No bitrate field: search tests supported rates 0.1..2.25 bits/pixel.
+ * Output data JSON: {bytes:[u8],bitrate:number,encodes:integer,
+ * status:"met"|"unattainable"|"encode_limit"|"deadline"|"codec_failure",
+ * failure:string|null,target_bytes:integer}. OK means a measured candidate
+ * exists; only status="met" promises its length fits this target. Best valid
+ * candidate survives later failures. No successful candidate => IMAGE_ERROR.
+ * Requires explicit 500 PPI. External NBIS tools are caller supplied. */
+UAREU_API uareu_status UAREU_CALL uareu_image_encode_wsq_target(uareu_handle image, const uint8_t *config, size_t length, uareu_handle *result);
+
+/* Additive interchange APIs. All inputs are BORROWED immutable data handles
+ * from uareu_data_from_json; successful outputs are OWNED data handles, freed
+ * once with uareu_data_free. Encode returns a JSON array of binary bytes;
+ * decode returns the schema below. Output is zero on failure. JSON input
+ * import is bounded to 16 MiB; existing status codes remain unchanged.
+ * These are independent SDK APIs, never dpfpdd/dpfj vendor ABI aliases. */
+#define UAREU_TEMPLATE_ISO_19794_2_2005 UINT32_C(0)
+#define UAREU_TEMPLATE_ANSI_378_2004 UINT32_C(1)
+/* MultiViewRecord JSON (all fields required):
+ * {width:u16,height:u16,pixels_per_cm_x:u16,pixels_per_cm_y:u16,
+ *  vendor_id:u16,subformat:u16,device_info:u16,views:[
+ *   {finger_position:u8,view_number:u8,impression:u8,quality:u8,minutiae:[
+ *    {x:u16,y:u16,kind:u8,direction_clockwise:number,quality:u8}]}]}.
+ * Explicit format must be one of the constants above. Geometry and scale >0;
+ * ISO scale >=99 pixels/cm. ANSI requires vendor_id>0; ISO cannot store vendor
+ * or subformat (decoded as zero). Reserved device bits 0x7000 must be zero.
+ * At most 176 views, positions 0..10, view numbers 0..15 consecutive from zero
+ * per finger in record order, at most 255 minutiae/view. Impression 0..3 or 8
+ * (ANSI also 9), quality 0..100; minutia kind 0..2, x/y inside geometry and
+ * <16384; finite clockwise direction in [0,2*pi), quantized by binary format.
+ * Extensions are rejected. This is transport/editable JSON, not extraction,
+ * recognition, biometric quality measurement, or certified interoperability. */
+UAREU_API uareu_status UAREU_CALL uareu_template_encode_views(uareu_handle record, uint32_t format, uareu_handle *data);
+UAREU_API uareu_status UAREU_CALL uareu_template_decode_views(uareu_handle data, uint32_t format, uareu_handle *record);
+/* Additive opaque extension transport: JSON {record:MultiViewRecord,
+ * extensions:[[{type_code:u16,data:[u8]}]]}; one list per record view.
+ * Reserved types and 65535-byte aggregate extension limits are validated.
+ * Payload semantics are uninterpreted and must match the selected format.
+ * Existing no-extension APIs still reject extension-bearing binary records.
+ * Inputs borrowed; outputs owned JSON data handles, zero on failure. */
+UAREU_API uareu_status UAREU_CALL uareu_template_encode_extended(uareu_handle record, uint32_t format, uareu_handle *data);
+UAREU_API uareu_status UAREU_CALL uareu_template_decode_extended(uareu_handle data, uint32_t format, uareu_handle *record);
+
+/* Optional external OpenJPEG lossless grayscale raw J2K codec. Config requires
+ * encoder:string,decoder:string; optional timeout_ms 1..300000 (default30000).
+ * Single-tile unsigned8-bit, one component; <=1MiB pixels, <=4MiB codestream.
+ * JP2 boxes, color, subsampling and high-bit-depth input are unsupported.
+ * Encode returns owned JSON byte-array data; decode returns an owned image.
+ * Raw codestreams carry no physical DPI: decode resolution remains unknown.
+ * Inputs borrowed; output zero on error; free data/image with matching APIs. */
+UAREU_API uareu_status UAREU_CALL uareu_image_encode_jpeg2000(uareu_handle image, const uint8_t *config, size_t length, uareu_handle *data);
+UAREU_API uareu_status UAREU_CALL uareu_image_decode_jpeg2000(uareu_handle data, const uint8_t *config, size_t length, uareu_handle *image);
+
+/* Separate legacy NBIS5 NFIQ1 assessment. Config requires engine_path:string;
+ * optional timeout_ms 1..300000 (default10000), ppi caller declaration.
+ * Explicit500PPI needed; no resampling; source image/metadata stay unchanged.
+ * Owned JSON outcome status: scored/unsupported_input/engine_unavailable/
+ * evaluation_failed. Scored score1..5 LOWER IS BETTER, never an NFIQ2 score.
+ * ABI OK indicates an outcome exists; inspect its status before using score.
+ * Output zero on ABI error; free successful result with uareu_data_free. */
+UAREU_API uareu_status UAREU_CALL uareu_image_assess_nfiq1(uareu_handle image, const uint8_t *config, size_t length, uareu_handle *outcome);
+/* MultiImageRecord JSON (all fields required), ISO 19794-4:2005 FIR/010 only:
+ * {capture_device_id:u16,acquisition_level:u16,scale_units:u8,
+ *  scan_resolution_x:u16,scan_resolution_y:u16,image_resolution_x:u16,
+ *  image_resolution_y:u16,compression:"raw8_bit"|"opaque_wsq"|
+ *  "opaque_jpeg2000",images:[{finger_position:u8,view_count:u8,
+ *  view_number:u8,quality:u8,impression:u8,width:u16,height:u16,data:[u8]}]}.
+ * 1..255 images; device<4096; scale_units 1=PPI/2=PPCM; image resolutions >0
+ * and <=scan resolutions. Positions 0..10; quality 0..100; impression 0..3/7..9;
+ * dimensions>0. For each finger view_count matches its image count and unique
+ * view_number covers 1..view_count. Raw8 data length=width*height <=1 MiB;
+ * opaque compressed data nonempty <=4 MiB/image; binary record <=32 MiB.
+ * Opaque data is transported unchanged: compressed dimensions, bit depth,
+ * image quality, WSQ/JPEG2000 validity are NOT verified or decompressed.
+ * Header resolution and acquisition values remain caller declarations. */
+UAREU_API uareu_status UAREU_CALL uareu_image_encode_images(uareu_handle record, uareu_handle *data);
+UAREU_API uareu_status UAREU_CALL uareu_image_decode_images(uareu_handle data, uareu_handle *record);
+/* Independent ANSI INCITS381:2004 FIR/010 raw8 transport. Record JSON:
+ * {cbeff_product_id:u32,appendix_f_compliant:bool,record:MultiImageRecord}.
+ * Product owner high16bits must be nonzero. Acquisition levels10/20/30/31/40/41;
+ * scan resolution<=1000 units; quality1..100 or254(undefined); impression0..3/7/8.
+ * Existing common geometry/scale/view limits apply. Compression must raw8_bit.
+ * Compliance/product/header scale remain declarations, not measured facts.
+ * Encode/decode return owned JSON data; view selects a zero-based index and
+ * returns an owned image with declared scale. Inputs borrowed; output0 on error.
+ * These are separate APIs: passing ANSI bytes to ISO APIs does not convert them.
+ * Other ANSI editions/compression/slap positions remain unsupported. */
+UAREU_API uareu_status UAREU_CALL uareu_image_encode_ansi381(uareu_handle record, uareu_handle *data);
+UAREU_API uareu_status UAREU_CALL uareu_image_decode_ansi381(uareu_handle data, uareu_handle *record);
+UAREU_API uareu_status UAREU_CALL uareu_image_ansi381_view(uareu_handle record, size_t view, uareu_handle *image);
+
 /* Single-view ISO 19794-4:2005 FIR/010 raw 8-bit subset. Config requires explicit
  * capture_device_id, acquisition_level, scale_units (1=PPI,2=PPCM),
  * scan_resolution_x/y, finger_position, quality, impression. Source image
@@ -206,6 +350,14 @@ UAREU_API uareu_status UAREU_CALL uareu_image_decode_wsq(uareu_handle data, cons
  * certification is guessed. Data handles contain JSON byte arrays. */
 UAREU_API uareu_status UAREU_CALL uareu_image_encode_record(uareu_handle image, const uint8_t *config, size_t length, uareu_handle *data);
 UAREU_API uareu_status UAREU_CALL uareu_image_decode_record(uareu_handle data, uareu_handle *image);
+/* Host flat-field correction using explicit same-size dark and bright reference
+ * images. minimum_response must be finite and in (0,255]. Profile is an owned
+ * JSON data handle; apply returns an owned image and preserves source metadata
+ * with profile-hash provenance. Inputs are borrowed; output is zero on failure.
+ * This does not calibrate reader hardware or establish PIV compliance. */
+UAREU_API uareu_status UAREU_CALL uareu_image_flat_field_profile(uareu_handle dark, uareu_handle bright, double minimum_response, uareu_handle *profile);
+UAREU_API uareu_status UAREU_CALL uareu_image_apply_flat_field(uareu_handle image, uareu_handle profile, uareu_handle *output);
+
 /* Optional local SourceAFIS helper config: executable, timeout_ms, optional
  * explicit ppi for extraction. Requests use operation:
  * extract {image}; compare {probe,candidate,threshold}; identify

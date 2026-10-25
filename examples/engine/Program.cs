@@ -43,12 +43,7 @@ try
         var template = new FingerprintTemplate(new FingerprintImage(width, height, pixels, new FingerprintImageOptions { Dpi = ppi }));
         result = new { data = template.ToByteArray().Select(b => (int)b).ToArray() };
     }
-    else if (op == "compare")
-    {
-        double score = new FingerprintMatcher(Template(request.GetProperty("probe"))).Match(Template(request.GetProperty("candidate")));
-        if (!double.IsFinite(score) || score < 0) throw new InvalidOperationException("Invalid engine score.");
-        result = new { score };
-    }
+    else if (op == "compare") result = ComparisonRequest.Run(request, Template);
     else if (op == "minutiae") result = NativeTemplate.Read(Bytes(request.GetProperty("template")));
     else if (op == "import_minutiae") result = new { data = NativeTemplate.Create(request.GetProperty("record")).Select(b => (int)b).ToArray() };
     else throw new ArgumentException("Unknown operation.");
@@ -64,4 +59,28 @@ catch (Exception error)
 {
     Console.Error.WriteLine(error.Message);
     return 1;
+}
+
+// Private additive request extension. Older helpers ignore additional_candidates;
+// newer helpers retain the original single-candidate response when it is absent.
+internal static class ComparisonRequest
+{
+    internal static object Run(JsonElement request, Func<JsonElement, FingerprintTemplate> template)
+    {
+        var matcher = new FingerprintMatcher(template(request.GetProperty("probe")));
+        double Match(JsonElement candidate)
+        {
+            double value = matcher.Match(template(candidate));
+            if (!double.IsFinite(value) || value < 0) throw new InvalidOperationException("Invalid engine score.");
+            return value;
+        }
+        double score = Match(request.GetProperty("candidate"));
+        if (!request.TryGetProperty("additional_candidates", out JsonElement additional)) return new { score };
+        if (additional.ValueKind != JsonValueKind.Array || additional.GetArrayLength() > 999)
+            throw new ArgumentException("At most 999 additional candidates are supported.");
+        double[] scores = new double[additional.GetArrayLength()];
+        int index = 0;
+        foreach (JsonElement candidate in additional.EnumerateArray()) scores[index++] = Match(candidate);
+        return new { score, additional_scores = scores };
+    }
 }

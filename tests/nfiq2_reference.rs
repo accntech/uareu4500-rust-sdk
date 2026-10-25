@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Opt-in real-engine check; test images and executables are never bundled.
-use std::{fs, path::PathBuf, process::Command, time::Duration};
+#[path = "support/reference_process.rs"]
+mod process;
+use sha2::{Digest, Sha256};
+use std::{fs, path::PathBuf, time::Duration};
 use uareu::{
     frame::Image,
     metadata::{CapturedImage, Resolution},
@@ -12,10 +15,16 @@ use uareu::{
 fn reference_cli_and_adapter_agree_on_identical_synthetic_pixels() {
     let executable =
         PathBuf::from(std::env::var_os("UAREU_NFIQ2_EXE").expect("set UAREU_NFIQ2_EXE"));
-    let model_info = std::env::var_os("UAREU_NFIQ2_MODEL").map(PathBuf::from);
+    let model_info = std::env::var_os("UAREU_NFIQ2_MODEL")
+        .map(|p| fs::canonicalize(p).expect("cannot resolve UAREU_NFIQ2_MODEL"));
     let input = PathBuf::from(
         std::env::var_os("UAREU_NFIQ2_TEST_PGM")
             .expect("set UAREU_NFIQ2_TEST_PGM to a synthetic 500-PPI fixture"),
+    );
+    let input = fs::canonicalize(input).unwrap();
+    assert!(
+        fs::metadata(&input).unwrap().len() <= 4 * 1024 * 1024,
+        "reference PGM exceeds input bound"
     );
     let bytes = fs::read(&input).unwrap();
     let mut offset = 0;
@@ -65,22 +74,23 @@ fn reference_cli_and_adapter_agree_on_identical_synthetic_pixels() {
     let QualityOutcome::Scored { score, .. } = outcome else {
         panic!("{outcome:?}");
     };
-    let mut command = Command::new(executable);
-    command.arg("-F");
+    let mut args = vec!["-F".into()];
     if let Some(model) = model_info {
-        command.arg("-m").arg(model);
+        args.push("-m".into());
+        args.push(model.into_os_string());
     }
-    let reference = command.arg(input).output().unwrap();
-    assert!(
-        reference.status.success(),
-        "{}",
-        String::from_utf8_lossy(&reference.stderr)
-    );
-    let reference_score: u8 = String::from_utf8(reference.stdout)
+    args.push(input.into_os_string());
+    let workspace = process::Workspace::new().unwrap();
+    let reference =
+        process::run(&executable, &args, &workspace.0, Duration::from_secs(30)).unwrap();
+    let reference_score: u8 = String::from_utf8(reference)
         .unwrap()
         .trim()
         .parse()
         .unwrap();
     assert_eq!(score, reference_score);
-    eprintln!("reference CLI and adapter agree: {score}");
+    eprintln!(
+        "{}",
+        serde_json::json!({"status":"passed", "score":score,"executable_sha256":format!("{:x}",Sha256::digest(fs::read(executable).unwrap())),"pixels_sha256":format!("{:x}",Sha256::digest(&captured.image.pixels)),"limitation":"same-engine adapter agreement, not reader scale or algorithm conformance"})
+    );
 }

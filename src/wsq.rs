@@ -22,7 +22,146 @@ pub struct WsqCodec {
     pub decoder: PathBuf,
     pub timeout: Duration,
 }
+/// Bounds for a measured bitrate search. The codec's per-process timeout also applies.
+#[derive(Clone, Copy, Debug)]
+pub struct WsqTargetOptions {
+    pub target_bytes: usize,
+    /// Total encoder invocations, including failed/timed-out invocations (1..=32).
+    pub max_encodes: usize,
+    /// One shared wall-clock budget for all attempts (0..=300 seconds, exclusive of zero).
+    pub deadline: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WsqTargetStatus {
+    /// At least one measured candidate fits. Search may stop at either budget.
+    Met,
+    /// The minimum supported bitrate exceeded the target. No global size guarantee
+    /// is inferred: encoded size need not be strictly monotonic with bitrate.
+    Unattainable,
+    EncodeLimit,
+    Deadline,
+    CodecFailure(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct WsqTargetResult {
+    /// Highest tested fitting bitrate, or smallest valid output if none fitted.
+    pub bytes: Vec<u8>,
+    pub bitrate: f64,
+    pub encodes: usize,
+    pub status: WsqTargetStatus,
+}
+
 impl WsqCodec {
+    /// Search 0.1..=2.25 bits/pixel using measured output lengths. This is a
+    /// maximum byte target, not an exact-size or image-quality promise. Search
+    /// tests both endpoints then bisects. A valid candidate survives later
+    /// failures/deadlines. If no attempt succeeds, return the underlying error.
+    pub fn encode_to_target(
+        &self,
+        captured: &CapturedImage,
+        options: WsqTargetOptions,
+    ) -> Result<WsqTargetResult> {
+        ensure!(
+            options.target_bytes > 0 && options.target_bytes <= 4 * 1024 * 1024,
+            "WSQ target size must be 1..4194304 bytes"
+        );
+        ensure!(
+            (1..=32).contains(&options.max_encodes),
+            "WSQ max_encodes must be 1..32"
+        );
+        ensure!(
+            options.deadline > Duration::ZERO && options.deadline <= Duration::from_secs(300),
+            "WSQ search deadline out of range"
+        );
+        ensure!(
+            self.timeout > Duration::ZERO && self.timeout <= Duration::from_secs(300),
+            "codec deadline out of range"
+        );
+        let start = Instant::now();
+        let mut best: Option<WsqTargetResult> = None;
+        let (mut low, mut high) = (0.1, 2.25);
+        let mut rate = high;
+        for attempt in 1..=options.max_encodes {
+            let remaining = options.deadline.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                if let Some(mut result) = best {
+                    result.status = if result.bytes.len() <= options.target_bytes {
+                        WsqTargetStatus::Met
+                    } else {
+                        WsqTargetStatus::Deadline
+                    };
+                    return Ok(result);
+                }
+                anyhow::bail!("NBIS search deadline expired before a valid output");
+            }
+            let bounded = Self {
+                timeout: self.timeout.min(remaining),
+                ..self.clone()
+            };
+            let bytes = match bounded.encode(captured, rate) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    if let Some(mut result) = best {
+                        result.encodes = attempt;
+                        result.status = if start.elapsed() >= options.deadline {
+                            WsqTargetStatus::Deadline
+                        } else {
+                            WsqTargetStatus::CodecFailure(error.to_string())
+                        };
+                        return Ok(result);
+                    }
+                    return Err(error);
+                }
+            };
+            let fits = bytes.len() <= options.target_bytes;
+            let replace = best.as_ref().is_none_or(|old| {
+                let old_fits = old.bytes.len() <= options.target_bytes;
+                if fits {
+                    !old_fits || rate > old.bitrate
+                } else {
+                    !old_fits && bytes.len() < old.bytes.len()
+                }
+            });
+            if replace {
+                best = Some(WsqTargetResult {
+                    bytes,
+                    bitrate: rate,
+                    encodes: attempt,
+                    status: WsqTargetStatus::EncodeLimit,
+                });
+            }
+            let result = best
+                .as_mut()
+                .expect("successful encode establishes candidate");
+            result.encodes = attempt;
+            if attempt == 1 && fits {
+                result.status = WsqTargetStatus::Met;
+                return Ok(best.expect("candidate exists"));
+            }
+            if attempt == 2 && !fits {
+                result.status = WsqTargetStatus::Unattainable;
+                return Ok(best.expect("candidate exists"));
+            }
+            if fits {
+                low = rate;
+            } else {
+                high = rate;
+            }
+            rate = if attempt == 1 {
+                low
+            } else {
+                (low + high) / 2.0
+            };
+        }
+        let mut result = best.context("NBIS search produced no output")?;
+        if result.bytes.len() <= options.target_bytes {
+            result.status = WsqTargetStatus::Met;
+        }
+        Ok(result)
+    }
+
     fn run(&self, executable: &Path, args: &[OsString], workspace: &Path) -> Result<()> {
         ensure!(executable.is_file(), "NBIS codec executable unavailable");
         ensure!(

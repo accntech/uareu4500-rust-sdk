@@ -29,6 +29,40 @@ pub struct Nfiq2 {
 }
 
 impl Nfiq2 {
+    /// Score one explicitly selected raw ISO image-record view. The header's
+    /// resolution is retained as a declaration, not a hardware measurement.
+    /// Compressed records must be independently decoded and verified first.
+    pub fn assess_record_view(
+        &self,
+        record: &crate::image_record::MultiImageRecord,
+        view: usize,
+    ) -> QualityOutcome {
+        match record.raw_image(view) {
+            Ok(mut image) => {
+                // ISO integer pixels/cm rounds nominal 500 PPI to 197 PPCM.
+                // Normalize only that documented carrier quantization for the
+                // scorer; do not mutate the record or infer measured reader DPI.
+                if record.scale_units == 2
+                    && record.image_resolution_x == 197
+                    && record.image_resolution_y == 197
+                {
+                    if let Resolution::Known { provenance, .. } = image.metadata.resolution.clone()
+                    {
+                        image.metadata.resolution = Resolution::Known {
+                            x_ppi: 500.0,
+                            y_ppi: 500.0,
+                            provenance,
+                        };
+                    }
+                }
+                self.assess(&image)
+            }
+            Err(error) => QualityOutcome::UnsupportedInput {
+                reason: format!("{error:#}"),
+            },
+        }
+    }
+
     pub fn assess(&self, captured: &CapturedImage) -> QualityOutcome {
         let unsupported = |reason: &str| QualityOutcome::UnsupportedInput {
             reason: reason.into(),
@@ -178,7 +212,7 @@ impl Nfiq2 {
 
 /// The upstream Windows model parser joins paths with '/'. That is incompatible
 /// with Rust's verbatim '\\?\' canonical paths, which disable slash normalization.
-fn canonical_cli_path(path: &Path) -> std::io::Result<PathBuf> {
+pub(super) fn canonical_cli_path(path: &Path) -> std::io::Result<PathBuf> {
     let canonical = path.canonicalize()?;
     #[cfg(windows)]
     {
@@ -198,7 +232,7 @@ fn canonical_cli_path(path: &Path) -> std::io::Result<PathBuf> {
     Ok(canonical)
 }
 
-fn hash_file(path: &Path) -> Result<String> {
+pub(super) fn hash_file(path: &Path) -> Result<String> {
     let mut file = File::open(path).context("cannot open engine/model for fingerprinting")?;
     let mut hasher = Sha256::new();
     let mut buffer = [0; 8192];
@@ -212,9 +246,9 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-struct Workspace(PathBuf);
+pub(super) struct Workspace(pub(super) PathBuf);
 impl Workspace {
-    fn new() -> Result<Self> {
+    pub(super) fn new() -> Result<Self> {
         for _ in 0..10 {
             let mut nonce = [0; 16];
             getrandom::fill(&mut nonce)?;
@@ -242,7 +276,7 @@ impl Drop for Workspace {
     }
 }
 
-fn private_file(path: &Path) -> Result<File> {
+pub(super) fn private_file(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -253,7 +287,7 @@ fn private_file(path: &Path) -> Result<File> {
     Ok(options.open(path)?)
 }
 
-fn run(
+pub(super) fn run(
     executable: &Path,
     args: &[&std::ffi::OsStr],
     directory: &Path,
@@ -273,7 +307,7 @@ fn run(
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    let mut child = command.spawn().context("cannot start NFIQ 2")?;
+    let mut child = command.spawn().context("cannot start quality engine")?;
     let started = Instant::now();
     loop {
         let oversized = [stdout.as_path(), stderr.as_path()]
@@ -283,9 +317,9 @@ fn run(
             let _ = child.kill();
             let _ = child.wait();
             bail!(if oversized {
-                "NFIQ 2 output exceeded 128 KiB"
+                "quality engine output exceeded 128 KiB"
             } else {
-                "NFIQ 2 evaluation timed out"
+                "quality engine evaluation timed out"
             });
         }
         match child.try_wait() {
@@ -296,7 +330,7 @@ fn run(
                         .take(OUTPUT_LIMIT)
                         .read_to_end(&mut error_output)?;
                     bail!(
-                        "NFIQ 2 process failed ({status}): {}",
+                        "quality engine process failed ({status}): {}",
                         String::from_utf8_lossy(&error_output).trim()
                     );
                 }
@@ -307,7 +341,7 @@ fn run(
                 ensure!(
                     output.len() as u64 <= OUTPUT_LIMIT
                         && fs::metadata(&stderr)?.len() <= OUTPUT_LIMIT,
-                    "NFIQ 2 output exceeded 128 KiB"
+                    "quality engine output exceeded 128 KiB"
                 );
                 return Ok(output);
             }

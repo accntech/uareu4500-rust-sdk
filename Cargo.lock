@@ -717,6 +717,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "futures-core",
  "getrandom",
  "nusb",
  "png",

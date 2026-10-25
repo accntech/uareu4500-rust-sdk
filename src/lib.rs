@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #![doc = include_str!("../README.md")]
+pub mod ansi381;
 pub mod error;
 pub mod ffi;
 pub mod frame;
 pub mod image_record;
+pub mod jpeg2000;
 pub mod metadata;
 pub mod processing;
 pub mod protocol;

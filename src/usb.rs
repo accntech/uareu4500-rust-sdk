@@ -61,10 +61,103 @@ pub fn readers() -> Result<Vec<DeviceInfo>> {
     Ok(readers)
 }
 
+/// Owned OS hotplug observation; only the exact opened device instance matches.
+/// It never treats a newly attached device at the same address as the old reader.
+struct ReaderHotplug {
+    stop: std::sync::Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    binding: std::sync::Arc<std::sync::Mutex<ReaderMonitor>>,
+}
+impl ReaderHotplug {
+    fn rebind(&self, monitor: &ReaderMonitor) {
+        let mut current = self.binding.lock().unwrap_or_else(|p| p.into_inner());
+        let previous = current.snapshot();
+        current.hotplug_monitoring(false);
+        *current = monitor.clone();
+        monitor.hotplug_monitoring(previous.hotplug_monitoring);
+        if previous.connected == Some(false) {
+            monitor.hotplug_disconnected();
+        }
+    }
+    fn start(id: nusb::DeviceId, monitor: ReaderMonitor) -> Result<Self> {
+        use futures_core::Stream;
+        use std::{
+            pin::Pin,
+            sync::{Arc, atomic::Ordering},
+            task::{Context, Poll, Wake, Waker},
+        };
+        struct WakeThread(std::thread::Thread);
+        impl Wake for WakeThread {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let mut watch = nusb::watch_devices()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let binding = Arc::new(std::sync::Mutex::new(monitor));
+        let observing = binding.clone();
+        let worker = std::thread::Builder::new()
+            .name("uareu-hotplug".into())
+            .spawn(move || {
+                struct ObservationGuard(std::sync::Arc<std::sync::Mutex<ReaderMonitor>>);
+                impl Drop for ObservationGuard {
+                    fn drop(&mut self) {
+                        self.0
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .hotplug_monitoring(false);
+                    }
+                }
+                let _guard = ObservationGuard(observing.clone());
+                let waker = Waker::from(Arc::new(WakeThread(std::thread::current())));
+                let mut context = Context::from_waker(&waker);
+                observing
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .hotplug_monitoring(true);
+                while !stopping.load(Ordering::Acquire) {
+                    match Pin::new(&mut watch).poll_next(&mut context) {
+                        Poll::Ready(Some(nusb::hotplug::HotplugEvent::Disconnected(gone)))
+                            if gone == id =>
+                        {
+                            observing
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .hotplug_disconnected();
+                            break;
+                        }
+                        Poll::Ready(Some(_)) => {}
+                        Poll::Ready(None) => break,
+                        Poll::Pending => std::thread::park_timeout(Duration::from_millis(100)),
+                    }
+                }
+            })?;
+        Ok(Self {
+            stop,
+            worker: Some(worker),
+            binding,
+        })
+    }
+}
+impl Drop for ReaderHotplug {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
+            let _ = worker.join();
+        }
+    }
+}
+
 /// An exclusively opened reader. Drop releases its USB interface.
 pub struct Reader {
     transport: UsbTransport,
     monitor: ReaderMonitor,
+    _hotplug: Option<ReaderHotplug>,
 }
 impl Reader {
     pub fn open(info: &DeviceInfo) -> Result<Self> {
@@ -83,6 +176,8 @@ impl Reader {
             )
             .into());
         }
+        let monitor = ReaderMonitor::default();
+        let hotplug = ReaderHotplug::start(info.id(), monitor.clone()).ok();
         let device = info.open().wait().context("cannot open reader; on Linux install the supplied udev rule; on macOS check USB accessory approval")?;
         let (number, alternate) = match device.active_configuration() {
             Ok(config) => capture_interface(config)?,
@@ -117,11 +212,12 @@ impl Reader {
         let image = interface.endpoint::<Bulk, In>(0x82)?;
         // Queue before power-up so that an early 0x56aa IRQ cannot be lost.
         interrupt.submit(Buffer::new(64));
-        let monitor = ReaderMonitor::default();
         monitor.claimed();
         Ok(Self {
-            monitor,
+            _hotplug: hotplug,
+            monitor: monitor.clone(),
             transport: UsbTransport {
+                identity_monitor: monitor,
                 interface,
                 interrupt,
                 image,
@@ -211,6 +307,10 @@ impl Reader {
     }
     pub(crate) fn with_monitor(mut self, monitor: ReaderMonitor) -> Self {
         self.monitor.released();
+        if let Some(watch) = &self._hotplug {
+            watch.rebind(&monitor);
+        }
+        rebind_identity_monitor(&mut self.transport.identity_monitor, &monitor);
         self.monitor = monitor;
         self.monitor.claimed();
         self
@@ -335,10 +435,17 @@ impl Drop for Reader {
 }
 
 struct UsbTransport {
+    identity_monitor: ReaderMonitor,
     interface: Interface,
     interrupt: Endpoint<Interrupt, In>,
     image: Endpoint<Bulk, In>,
     cancelled: bool,
+}
+fn rebind_identity_monitor(current: &mut ReaderMonitor, next: &ReaderMonitor) {
+    if let Some(observation) = current.snapshot().last_identity_observation {
+        next.identity_observed(observation);
+    }
+    *current = next.clone();
 }
 impl UsbTransport {
     fn rearm(&mut self) -> Result<()> {
@@ -366,6 +473,10 @@ impl UsbTransport {
     }
 }
 impl Transport for UsbTransport {
+    fn identity_observed(&mut self, raw: [u8; 16]) {
+        self.identity_monitor
+            .identity_observed(crate::reader::IdentityObservation::from_raw(raw));
+    }
     fn read_registers(&mut self, register: u16, length: u16, timeout: Duration) -> Result<Vec<u8>> {
         self.interface
             .control_in(
@@ -444,5 +555,67 @@ impl Transport for UsbTransport {
         self.interrupt.cancel_all();
         // Dropping Reader immediately after capture cancels/drains backend
         // resources and releases the interface, including all endpoint references.
+    }
+}
+
+#[cfg(test)]
+mod hotplug_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    #[test]
+    fn identity_rebinding_preserves_history_and_routes_new_observations_to_current_monitor() {
+        let old = ReaderMonitor::default();
+        old.identity_observed(crate::reader::IdentityObservation::from_raw([17; 16]));
+        let observed_at = old
+            .snapshot()
+            .last_identity_observation
+            .unwrap()
+            .observed_unix_ms;
+        let current = ReaderMonitor::default();
+        let mut bound = old.clone();
+        rebind_identity_monitor(&mut bound, &current);
+        assert_eq!(
+            current.snapshot().last_identity_observation.unwrap().raw,
+            [17; 16]
+        );
+        assert_eq!(
+            current
+                .snapshot()
+                .last_identity_observation
+                .unwrap()
+                .observed_unix_ms,
+            observed_at
+        );
+        bound.identity_observed(crate::reader::IdentityObservation::from_raw([29; 16]));
+        assert_eq!(
+            current.snapshot().last_identity_observation.unwrap().raw,
+            [29; 16]
+        );
+        assert_eq!(
+            old.snapshot().last_identity_observation.unwrap().raw,
+            [17; 16]
+        );
+        assert_eq!(current.snapshot().hardware_ready, None);
+        assert_eq!(current.snapshot().calibration_required, None);
+        assert_eq!(current.snapshot().connected, None);
+    }
+    #[test]
+    fn rebinding_preserves_disconnection_and_wakes_current_monitor() {
+        let old = ReaderMonitor::default();
+        old.hotplug_monitoring(true);
+        old.hotplug_disconnected();
+        let binding = Arc::new(Mutex::new(old.clone()));
+        let watch = ReaderHotplug {
+            stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            binding: binding.clone(),
+        };
+        let current = ReaderMonitor::default();
+        watch.rebind(&current);
+        assert_eq!(current.snapshot().connected, Some(false));
+        assert!(current.snapshot().hotplug_monitoring);
+        assert!(!old.snapshot().hotplug_monitoring);
+        binding.lock().unwrap().hotplug_monitoring(false);
+        assert!(!current.snapshot().hotplug_monitoring);
     }
 }

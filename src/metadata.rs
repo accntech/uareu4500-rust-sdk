@@ -98,7 +98,9 @@ pub enum ProcessingStep {
     IntensityInversion,
     Rotate180,
     ContrastStretch { lower: u8, upper: u8 },
+    FlatFieldCorrection { profile_sha256: [u8; 32] },
     WsqDecompression,
+    Jpeg2000Decompression,
     ImageRecordImport,
 }
 

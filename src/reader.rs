@@ -2,7 +2,8 @@
 //! SDK capabilities and cached lifecycle observations, not live hardware probes.
 use crate::{error::CaptureFailure, protocol::CaptureEvent};
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,6 +32,11 @@ pub struct SdkCapabilities {
     pub wsq_backend: &'static str,
     pub hardware_status_probe: bool,
     pub soft_recovery: bool,
+    pub status_change_wait: bool,
+    pub multiview_interchange: bool,
+    pub record_editing: bool,
+    pub wsq_target_size: bool,
+    pub quality_record_view: bool,
     pub interchange_formats: &'static [&'static str],
 }
 #[derive(Clone, Debug, Serialize)]
@@ -79,10 +85,20 @@ impl ReaderCapabilities {
                 wsq_backend: "optional_external_nbis_tools_required",
                 hardware_status_probe: true,
                 soft_recovery: true,
+                status_change_wait: true,
+                multiview_interchange: true,
+                record_editing: true,
+                wsq_target_size: true,
+                quality_record_view: true,
                 interchange_formats: &[
                     "iso19794_4_2005_raw_single_view",
                     "iso19794_2_2005_single_view",
                     "ansi378_2004_single_view",
+                    "iso19794_2_2005_multiview",
+                    "ansi378_2004_multiview",
+                    "iso19794_4_2005_raw_multi_image",
+                    "iso19794_4_2005_opaque_wsq_multi_image",
+                    "iso19794_4_2005_opaque_jpeg2000_multi_image",
                 ],
             },
             device: DeviceCapabilities {
@@ -136,7 +152,11 @@ pub struct ReaderStatus {
     pub connected: Option<bool>,
     pub last_outcome: Option<CaptureOutcome>,
     pub last_hardware_observation: Option<HardwareObservation>,
+    /// Historical raw initialization information, not a live identity/version query.
+    pub last_identity_observation: Option<IdentityObservation>,
     pub last_probe_failure: Option<CaptureFailure>,
+    /// True while an owned OS USB hotplug subscription is active.
+    pub hotplug_monitoring: bool,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct HardwareObservation {
@@ -147,6 +167,33 @@ pub struct HardwareObservation {
     pub low_power: bool,
     pub hardware_ready: Option<bool>,
     pub calibration_required: Option<bool>,
+}
+/// Opaque register-f0 information retained from ordinary initialization. Upstream
+/// logs these byte pairs as versions but explicitly does not know which is
+/// hardware versus firmware. Neither pair supplies DPI or capability evidence.
+#[derive(Clone, Debug, Serialize)]
+pub struct IdentityObservation {
+    pub source: &'static str,
+    pub protocol_reference: &'static str,
+    pub observed_unix_ms: Option<u64>,
+    pub raw: [u8; 16],
+    pub version_pair_10_11: [u8; 2],
+    pub version_pair_4_5: [u8; 2],
+}
+impl IdentityObservation {
+    pub(crate) fn from_raw(raw: [u8; 16]) -> Self {
+        Self {
+            source: "usb_register_f0_during_initialization",
+            protocol_reference: "https://gitlab.freedesktop.org/libfprint/libfprint/-/blob/6f9479c3d55f847c1b3769f28ceb99227f9858cf/libfprint/drivers/uru4000.c#L1192-1206",
+            observed_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|d| u64::try_from(d.as_millis()).ok()),
+            version_pair_10_11: [raw[10], raw[11]],
+            version_pair_4_5: [raw[4], raw[5]],
+            raw,
+        }
+    }
 }
 impl Default for ReaderStatus {
     fn default() -> Self {
@@ -163,15 +210,20 @@ impl Default for ReaderStatus {
             connected: None,
             last_outcome: None,
             last_hardware_observation: None,
+            last_identity_observation: None,
             last_probe_failure: None,
+            hotplug_monitoring: false,
         }
     }
 }
 /// Clone before consuming Reader in capture, then query from another thread.
 /// Queries never perform USB I/O and cannot establish current physical readiness.
 #[derive(Clone, Debug, Default)]
-pub struct ReaderMonitor(Arc<Mutex<ReaderStatus>>);
+pub struct ReaderMonitor(Arc<(Mutex<ReaderStatus>, Condvar)>);
 impl ReaderMonitor {
+    pub(crate) fn identity_observed(&self, observation: IdentityObservation) {
+        self.change(|s| s.last_identity_observation = Some(observation));
+    }
     pub(crate) fn begin_probe(&self) {
         self.change(|s| {
             if s.operation != ReaderOperation::Closed {
@@ -198,15 +250,47 @@ impl ReaderMonitor {
         });
     }
     fn change(&self, update: impl FnOnce(&mut ReaderStatus)) {
-        let mut state = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self.0.0.lock().unwrap_or_else(|poison| poison.into_inner());
         state.sequence = state.sequence.saturating_add(1);
         update(&mut state);
+        drop(state);
+        self.0.1.notify_all();
     }
     pub fn snapshot(&self) -> ReaderStatus {
         self.0
+            .0
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
+    }
+    /// Wait for a newer lifecycle or USB-hotplug observation. No polling USB I/O.
+    /// Returns None on timeout or if already closed without a newer sequence.
+    /// Deliberately caps a single wait to five minutes; callers can wait again.
+    pub fn wait_for_change(&self, after_sequence: u64, timeout: Duration) -> Option<ReaderStatus> {
+        let state = self.0.0.lock().unwrap_or_else(|p| p.into_inner());
+        let (state, _) = self
+            .0
+            .1
+            .wait_timeout_while(state, timeout.min(Duration::from_secs(300)), |s| {
+                s.sequence <= after_sequence && s.operation != ReaderOperation::Closed
+            })
+            .unwrap_or_else(|p| p.into_inner());
+        (state.sequence > after_sequence).then(|| state.clone())
+    }
+    pub(crate) fn hotplug_monitoring(&self, active: bool) {
+        self.change(|s| {
+            s.hotplug_monitoring = active;
+            if active {
+                s.source = "sdk_lifecycle_and_usb_hotplug";
+            }
+        });
+    }
+    pub(crate) fn hotplug_disconnected(&self) {
+        self.change(|s| {
+            s.connected = Some(false);
+            s.hardware_ready = None;
+            s.finger_present = None;
+        });
     }
     pub(crate) fn claimed(&self) {
         self.change(|s| s.interface_claimed = true);
@@ -288,6 +372,63 @@ impl ReaderMonitor {
 mod tests {
     use super::*;
     use crate::error::{CaptureError, CaptureErrorKind, CaptureStage};
+    #[test]
+    fn identity_observation_is_historical_raw_evidence_without_inferred_device_status() {
+        let monitor = ReaderMonitor::default();
+        assert!(monitor.snapshot().last_identity_observation.is_none());
+        let raw = std::array::from_fn(|i| i as u8);
+        let after = monitor.snapshot().sequence;
+        monitor.identity_observed(IdentityObservation::from_raw(raw));
+        let observed = monitor.wait_for_change(after, Duration::ZERO).unwrap();
+        let info = observed.last_identity_observation.unwrap();
+        assert_eq!(info.raw, raw);
+        assert_eq!(info.version_pair_10_11, [10, 11]);
+        assert_eq!(info.version_pair_4_5, [4, 5]);
+        assert!(
+            info.protocol_reference
+                .contains("6f9479c3d55f847c1b3769f28ceb99227f9858cf")
+        );
+        assert_eq!(observed.connected, None);
+        assert_eq!(observed.hardware_ready, None);
+        assert_eq!(observed.calibration_required, None);
+        monitor.finish(Some(CaptureFailure {
+            kind: CaptureErrorKind::Other,
+            stage: Some(CaptureStage::Initialization),
+            message: "failure after information read".into(),
+            cleanup: None,
+        }));
+        monitor.hotplug_disconnected();
+        monitor.close();
+        let retained = monitor.snapshot().last_identity_observation.unwrap();
+        assert_eq!(retained.raw, raw);
+        assert_eq!(retained.observed_unix_ms, info.observed_unix_ms);
+    }
+    #[test]
+    fn status_waits_wake_on_observations_and_close_without_claiming_readiness() {
+        let monitor = ReaderMonitor::default();
+        let after = monitor.snapshot().sequence;
+        let other = monitor.clone();
+        let waiter =
+            std::thread::spawn(move || other.wait_for_change(after, Duration::from_secs(1)));
+        monitor.hotplug_disconnected();
+        let result = waiter.join().unwrap().unwrap();
+        assert_eq!(result.connected, Some(false));
+        assert_eq!(result.hardware_ready, None);
+        let after = result.sequence;
+        let other = monitor.clone();
+        let waiter =
+            std::thread::spawn(move || other.wait_for_change(after, Duration::from_secs(1)));
+        monitor.close();
+        assert_eq!(
+            waiter.join().unwrap().unwrap().operation,
+            ReaderOperation::Closed
+        );
+        assert!(
+            monitor
+                .wait_for_change(u64::MAX, Duration::from_secs(1))
+                .is_none()
+        );
+    }
     #[test]
     fn capabilities_never_infer_device_features_from_usb_identity() {
         assert!(ReaderCapabilities::for_usb_id(0, 0).is_none());

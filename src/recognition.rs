@@ -15,6 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod enrollment;
+pub use enrollment::{EnrollmentConfig, EnrollmentProgress, EnrollmentSession};
+
 #[derive(Clone, Debug)]
 pub struct RecognitionEngine {
     pub executable: PathBuf,
@@ -59,8 +62,57 @@ pub struct Candidate {
     pub score: f64,
 }
 
+const REQUEST_LIMIT: usize = 16 * 1024 * 1024;
+
+#[derive(Serialize)]
+struct ComparisonBatch<'a> {
+    operation: &'static str,
+    probe: &'a [u8],
+    candidate: &'a [u8],
+    additional_candidates: Vec<&'a [u8]>,
+}
+
+struct RequestCounter {
+    length: usize,
+    overflow: bool,
+}
+impl Write for RequestCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > REQUEST_LIMIT.saturating_sub(self.length) {
+            self.overflow = true;
+            return Err(std::io::Error::other("recognition request exceeds 16 MiB"));
+        }
+        self.length += bytes.len();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn request_fits(request: &impl Serialize) -> Result<bool> {
+    let mut counter = RequestCounter {
+        length: 0,
+        overflow: false,
+    };
+    let result = serde_json::to_writer(&mut counter, request);
+    if counter.overflow {
+        return Ok(false);
+    }
+    result?;
+    Ok(true)
+}
+fn score(value: &serde_json::Value) -> Result<f64> {
+    let score = value.as_f64().context("missing similarity score")?;
+    ensure!(
+        score.is_finite() && score >= 0.0,
+        "invalid similarity score"
+    );
+    Ok(score)
+}
+
 impl RecognitionEngine {
-    fn execute(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
+    fn execute(&self, request: &impl Serialize) -> Result<serde_json::Value> {
+        let start = Instant::now();
         ensure!(
             self.timeout > Duration::ZERO && self.timeout <= Duration::from_secs(300),
             "invalid engine deadline"
@@ -72,7 +124,7 @@ impl RecognitionEngine {
         let temp = Workspace::new()?;
         let input = serde_json::to_vec(request)?;
         ensure!(
-            input.len() <= 16 * 1024 * 1024,
+            input.len() <= REQUEST_LIMIT,
             "recognition request exceeds 16 MiB"
         );
         let input_path = temp.0.join("request.json");
@@ -97,7 +149,6 @@ impl RecognitionEngine {
             }
         }
         let mut child = Child(command.spawn().context("cannot start recognition helper")?);
-        let start = Instant::now();
         loop {
             ensure!(
                 fs::metadata(&stdout)?.len() <= 16 * 1024 * 1024
@@ -217,13 +268,7 @@ impl RecognitionEngine {
             response["engine_sha256"] == probe.identity.engine_sha256,
             "engine build differs from template; re-extract from original images"
         );
-        let score = response["result"]["score"]
-            .as_f64()
-            .context("missing similarity score")?;
-        ensure!(
-            score.is_finite() && score >= 0.0,
-            "invalid similarity score"
-        );
+        let score = score(&response["result"]["score"])?;
         Ok(MatchResult {
             score,
             threshold,
@@ -246,26 +291,88 @@ impl RecognitionEngine {
             candidates.len() <= 1000 && maximum > 0 && maximum <= 1000,
             "invalid candidate count"
         );
-        let started = Instant::now();
-        let mut results = Vec::new();
-        for (index, candidate) in candidates.iter().enumerate() {
-            let remaining = self.timeout.saturating_sub(started.elapsed());
-            ensure!(!remaining.is_zero(), "identification timed out");
-            let engine = Self {
-                executable: self.executable.clone(),
-                timeout: remaining,
-            };
-            let matched = engine.compare(probe, candidate, threshold)?;
-            if matched.matched {
-                results.push(Candidate {
-                    index,
-                    score: matched.score,
-                });
-            }
-        }
+        let scores = self.comparison_scores(probe, candidates, threshold)?;
+        let mut results: Vec<_> = scores
+            .into_iter()
+            .enumerate()
+            .filter(|(_, score)| *score >= threshold)
+            .map(|(index, score)| Candidate { index, score })
+            .collect();
         results.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.index.cmp(&b.index)));
         results.truncate(maximum);
         Ok(results)
+    }
+    fn comparison_scores(
+        &self,
+        probe: &FingerprintTemplate,
+        candidates: &[FingerprintTemplate],
+        threshold: f64,
+    ) -> Result<Vec<f64>> {
+        let started = Instant::now();
+        self.validate(probe)?;
+        for candidate in candidates {
+            self.validate(candidate)?;
+            ensure!(
+                probe.identity.engine_sha256 == candidate.identity.engine_sha256,
+                "templates use different engine builds"
+            );
+        }
+        let Some((first, additional)) = candidates.split_first() else {
+            return Ok(Vec::new());
+        };
+        ensure!(
+            self.timeout > Duration::ZERO && self.timeout <= Duration::from_secs(300),
+            "invalid engine deadline"
+        );
+        let remaining_engine = || -> Result<Self> {
+            let remaining = self.timeout.saturating_sub(started.elapsed());
+            ensure!(!remaining.is_zero(), "recognition timed out");
+            Ok(Self {
+                executable: self.executable.clone(),
+                timeout: remaining,
+            })
+        };
+        let batch = ComparisonBatch {
+            operation: "compare",
+            probe: &probe.data,
+            candidate: &first.data,
+            additional_candidates: additional.iter().map(|t| t.data.as_slice()).collect(),
+        };
+        let mut scores = Vec::with_capacity(candidates.len());
+        let legacy = if request_fits(&batch)? {
+            let response = remaining_engine()?.execute(&batch)?;
+            ensure!(
+                response["engine_sha256"] == probe.identity.engine_sha256,
+                "engine build differs from template; re-extract from original images"
+            );
+            scores.push(score(&response["result"]["score"])?);
+            if let Some(extra) = response["result"].get("additional_scores") {
+                let extra = extra
+                    .as_array()
+                    .context("invalid additional similarity scores")?;
+                ensure!(
+                    extra.len() == additional.len(),
+                    "invalid additional similarity score count"
+                );
+                scores.extend(extra.iter().map(score).collect::<Result<Vec<_>>>()?);
+                return Ok(scores);
+            }
+            // Old helpers ignore additive request fields. Their first result is
+            // already valid, so compare only the remainder under the same budget.
+            additional
+        } else {
+            // The pre-existing API caps each comparison request, not the gallery
+            // aggregate. Keep large previously valid galleries on that path.
+            candidates
+        };
+        for candidate in legacy {
+            scores.push(
+                remaining_engine()?
+                    .compare(probe, candidate, threshold)?
+                    .score,
+            );
+        }
+        Ok(scores)
     }
     /// Multi-template enrollment with explicit consistency policy, not vendor fusion.
     pub fn enroll(&self, samples: &[FingerprintTemplate], threshold: f64) -> Result<Enrollment> {
@@ -306,20 +413,14 @@ impl RecognitionEngine {
             enrollment.schema_version == 1 && (2..=10).contains(&enrollment.samples.len()),
             "invalid enrollment"
         );
-        let start = Instant::now();
-        let mut score = 0.0f64;
-        for sample in &enrollment.samples {
-            let remaining = self.timeout.saturating_sub(start.elapsed());
-            ensure!(!remaining.is_zero(), "verification timed out");
-            score = score.max(
-                Self {
-                    executable: self.executable.clone(),
-                    timeout: remaining,
-                }
-                .compare(probe, sample, threshold)?
-                .score,
-            );
-        }
+        ensure!(
+            threshold.is_finite() && threshold > 0.0,
+            "explicit positive finite threshold required"
+        );
+        let score = self
+            .comparison_scores(probe, &enrollment.samples, threshold)?
+            .into_iter()
+            .fold(0.0f64, f64::max);
         Ok(MatchResult {
             score,
             threshold,

@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "status": "blocked_input",
+  "vectors": [],
+  "reason": "No independently produced ANSI 378:2004, ISO 19794-2:2005 or ISO 19794-4:2005 reference vectors and consumer were supplied. This inventory is not a runnable test manifest."
+}

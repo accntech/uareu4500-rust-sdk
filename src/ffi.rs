@@ -597,6 +597,54 @@ pub unsafe extern "C" fn uareu_reader_get_status_json(
     })
 }
 
+/// Wait for a cached status sequence change; no USB polling is performed.
+/// # Safety
+/// completed and output must point to writable u32/u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_reader_wait_status_json(
+    handle: u64,
+    after_sequence: u64,
+    timeout_ms: u32,
+    completed: *mut u32,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+            write(completed, 0)?;
+        }
+        if timeout_ms > 300_000 {
+            return Err(error(INVALID_ARGUMENT, "status wait deadline out of range"));
+        }
+        let context = reader(handle)?;
+        if let Some(status) = wait_reader_status(&context.state, after_sequence, timeout_ms)? {
+            let id = data(&status)?;
+            unsafe {
+                write(output, id)?;
+                write(completed, 1)?;
+            }
+        }
+        Ok(())
+    })
+}
+
+fn wait_reader_status(
+    state: &Mutex<ReaderState>,
+    after_sequence: u64,
+    timeout_ms: u32,
+) -> Result<Option<crate::reader::ReaderStatus>> {
+    let monitor = {
+        let state = state
+            .lock()
+            .map_err(|_| error(INTERNAL_ERROR, "reader state is poisoned"))?;
+        if state.closed {
+            return Err(error(INVALID_HANDLE, "reader is closed"));
+        }
+        state.monitor.clone()
+    };
+    Ok(monitor.wait_for_change(after_sequence, Duration::from_millis(u64::from(timeout_ms))))
+}
+
 /// Capabilities for an open reader handle, without USB I/O.
 /// # Safety
 /// Buffer/required pointers follow the contract of `uareu_last_error`.
@@ -914,6 +962,132 @@ pub unsafe extern "C" fn uareu_capture_start(
         unsafe { write(output, id) }
     })
 }
+/// Completion callback for this SDK's independent C ABI.
+pub type CaptureCompletionCallback = unsafe extern "C" fn(u32, u64, u64, *mut std::ffi::c_void);
+
+struct CompletionGate {
+    enabled: Mutex<Option<bool>>,
+    ready: std::sync::Condvar,
+}
+impl CompletionGate {
+    fn release(&self, enabled: bool) {
+        *self.enabled.lock().unwrap_or_else(|p| p.into_inner()) = Some(enabled);
+        self.ready.notify_all();
+    }
+    fn wait(&self) -> bool {
+        let mut enabled = self.enabled.lock().unwrap_or_else(|p| p.into_inner());
+        while enabled.is_none() {
+            enabled = self.ready.wait(enabled).unwrap_or_else(|p| p.into_inner());
+        }
+        enabled.unwrap_or(false)
+    }
+}
+fn deliver_completion(
+    callback: CaptureCompletionCallback,
+    context: usize,
+    result: anyhow::Result<CapturedImage>,
+) {
+    let result = result.map_err(capture_error).and_then(register_image);
+    let (status, image, report) = match result {
+        Ok(image) => (OK, image, 0),
+        Err(failure) => {
+            let status = failure.0;
+            let report = data(&ErrorReport::from_failure(failure)).unwrap_or(0);
+            (status, 0, report)
+        }
+    };
+    // Caller guarantees executable callback code and a valid context until free
+    // finishes joining the worker. No SDK lock is held across this call.
+    unsafe {
+        callback(status, image, report, context as *mut std::ffi::c_void);
+    }
+}
+fn start_callback_operation(
+    cancel: Arc<AtomicBool>,
+    operation: impl FnOnce(Arc<AtomicBool>) -> anyhow::Result<CapturedImage> + Send + 'static,
+    callback: CaptureCompletionCallback,
+    context: usize,
+    output: *mut u64,
+) -> Result<()> {
+    let gate = Arc::new(CompletionGate {
+        enabled: Mutex::new(None),
+        ready: std::sync::Condvar::new(),
+    });
+    let delivery = gate.clone();
+    let job = Arc::new(
+        CaptureTask::spawn_with_completion(cancel, operation, move |result| {
+            if delivery.wait() {
+                deliver_completion(callback, context, result);
+            }
+        })
+        .map_err(|e| mapped(INTERNAL_ERROR, e))?,
+    );
+    // Keep an Arc while attempting insertion so its failure cannot drop/join a
+    // worker still waiting for this gate.
+    let id = match insert(Object::Task(job.clone())) {
+        Ok(id) => id,
+        Err(error) => {
+            gate.release(false);
+            let _ = job.close();
+            return Err(error);
+        }
+    };
+    if let Err(error) = unsafe { write(output, id) } {
+        gate.release(false);
+        let _ = job.close();
+        let _ = release(id, |o| matches!(o, Object::Task(_)));
+        return Err(error);
+    }
+    gate.release(true);
+    Ok(())
+}
+/// Start capture with one worker-thread completion notification. This is the
+/// SDK's own C ABI, not a dpfpdd callback or calling-convention alias.
+/// # Safety
+/// output must be writable; callback/context must remain valid until task free
+/// returns. The callback must not unwind or unload the library.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_capture_start_with_completion(
+    handle: u64,
+    timeout_ms: u32,
+    rotate180: u32,
+    callback: Option<CaptureCompletionCallback>,
+    context: *mut std::ffi::c_void,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let callback =
+            callback.ok_or_else(|| error(INVALID_ARGUMENT, "completion callback required"))?;
+        if !(1..=3_600_000).contains(&timeout_ms) || rotate180 > 1 {
+            return Err(error(INVALID_ARGUMENT, "invalid capture options"));
+        }
+        let reader = reader(handle)?;
+        let (guard, idle) = CaptureGuard::begin(reader.state.clone())?;
+        let cancel = guard.cancel.clone();
+        start_callback_operation(
+            cancel,
+            move |_| {
+                capture_once(
+                    reader,
+                    guard,
+                    idle,
+                    CaptureOptions {
+                        timeout: Duration::from_millis(timeout_ms.into()),
+                        rotate180: rotate180 == 1,
+                    },
+                    |_| {},
+                )
+            },
+            callback,
+            context as usize,
+            output,
+        )
+    })
+}
+
 /// Wait/poll. completed=0 means pending; completed=1 consumes the result once.
 /// Errors are copied to this calling thread's last-error report.
 /// # Safety
@@ -992,10 +1166,18 @@ pub unsafe extern "C" fn uareu_task_get_status_json(
 #[unsafe(no_mangle)]
 pub extern "C" fn uareu_task_free(handle: u64) -> u32 {
     boundary(|| {
-        let Object::Task(job) = release(handle, |object| matches!(object, Object::Task(_)))? else {
-            unreachable!()
-        };
-        job.close().map_err(|e| mapped(INTERNAL_ERROR, e))
+        let job = task(handle)?;
+        job.close().map_err(|e| {
+            if e.downcast_ref::<crate::task::TaskError>()
+                == Some(&crate::task::TaskError::CloseFromWorker)
+            {
+                error(BUSY, e.to_string())
+            } else {
+                mapped(INTERNAL_ERROR, e)
+            }
+        })?;
+        release(handle, |object| matches!(object, Object::Task(_)))?;
+        Ok(())
     })
 }
 
@@ -1134,6 +1316,135 @@ pub unsafe extern "C" fn uareu_image_encode_wsq(
         unsafe { write(output, id) }
     })
 }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WsqTargetConfig {
+    encoder: std::path::PathBuf,
+    decoder: std::path::PathBuf,
+    timeout_ms: Option<u64>,
+    target_bytes: usize,
+    max_encodes: Option<usize>,
+}
+/// Measured WSQ size search; output owns bytes and explicit search diagnostics.
+/// # Safety
+/// config must contain length readable JSON bytes; output must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_encode_wsq_target(
+    handle: u64,
+    config: *const u8,
+    length: usize,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let config: WsqTargetConfig = unsafe { json_input(config, length)? };
+        let max_encodes = config.max_encodes.unwrap_or(8);
+        if !(1..=4 * 1024 * 1024).contains(&config.target_bytes) || !(1..=32).contains(&max_encodes)
+        {
+            return Err(error(
+                INVALID_ARGUMENT,
+                "WSQ target_bytes/max_encodes out of range",
+            ));
+        }
+        let codec = WsqConfig {
+            encoder: config.encoder,
+            decoder: config.decoder,
+            timeout_ms: config.timeout_ms,
+            bitrate: None,
+        }
+        .codec()?;
+        let result = codec
+            .encode_to_target(
+                &image(handle)?.captured,
+                crate::wsq::WsqTargetOptions {
+                    target_bytes: config.target_bytes,
+                    max_encodes,
+                    deadline: codec.timeout,
+                },
+            )
+            .map_err(|e| mapped(IMAGE_ERROR, e))?;
+        let (status, failure) = match result.status {
+            crate::wsq::WsqTargetStatus::Met => ("met", None),
+            crate::wsq::WsqTargetStatus::Unattainable => ("unattainable", None),
+            crate::wsq::WsqTargetStatus::EncodeLimit => ("encode_limit", None),
+            crate::wsq::WsqTargetStatus::Deadline => ("deadline", None),
+            crate::wsq::WsqTargetStatus::CodecFailure(message) => ("codec_failure", Some(message)),
+        };
+        let id = data(
+            &serde_json::json!({"bytes":result.bytes,"bitrate":result.bitrate,"encodes":result.encodes,"status":status,"failure":failure,"target_bytes":config.target_bytes}),
+        )?;
+        unsafe { write(output, id) }
+    })
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Jpeg2000Config {
+    encoder: std::path::PathBuf,
+    decoder: std::path::PathBuf,
+    timeout_ms: Option<u64>,
+}
+impl Jpeg2000Config {
+    fn codec(self) -> Result<crate::jpeg2000::Jpeg2000Codec> {
+        let timeout = self.timeout_ms.unwrap_or(30_000);
+        if !(1..=300_000).contains(&timeout) {
+            return Err(error(INVALID_ARGUMENT, "codec deadline out of range"));
+        }
+        Ok(crate::jpeg2000::Jpeg2000Codec {
+            encoder: self.encoder,
+            decoder: self.decoder,
+            timeout: Duration::from_millis(timeout),
+        })
+    }
+}
+/// Encode lossless grayscale J2K using explicitly supplied external OpenJPEG tools.
+/// # Safety
+/// config must contain length readable JSON bytes; output must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_encode_jpeg2000(
+    handle: u64,
+    config: *const u8,
+    length: usize,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let config: Jpeg2000Config = unsafe { json_input(config, length)? };
+        let codec = config.codec()?;
+        let bytes = codec
+            .encode(&image(handle)?.captured)
+            .map_err(|e| mapped(IMAGE_ERROR, e))?;
+        let id = data(&bytes)?;
+        unsafe { write(output, id) }
+    })
+}
+/// Decode a J2K JSON byte-array data handle; raw codestreams carry no physical DPI.
+/// # Safety
+/// config must contain length readable JSON bytes; output must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_decode_jpeg2000(
+    handle: u64,
+    config: *const u8,
+    length: usize,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let config: Jpeg2000Config = unsafe { json_input(config, length)? };
+        let codec = config.codec()?;
+        let bytes: Vec<u8> = read_data(handle)?;
+        let decoded = codec.decode(&bytes).map_err(|e| mapped(IMAGE_ERROR, e))?;
+        let id = register_image(decoded)?;
+        unsafe { write(output, id) }
+    })
+}
+
 /// Decode a JSON-byte-array data handle using external NBIS, preserving its PPI declaration.
 /// # Safety
 /// config must contain length readable JSON bytes; output must be writable.
@@ -1195,6 +1506,224 @@ pub unsafe extern "C" fn uareu_image_decode_record(handle: u64, output: *mut u64
     })
 }
 
+fn template_format(format: u32) -> Result<crate::template_io::TemplateFormat> {
+    match format {
+        0 => Ok(crate::template_io::TemplateFormat::Iso19794_2_2005),
+        1 => Ok(crate::template_io::TemplateFormat::Ansi378_2004),
+        _ => Err(error(INVALID_ARGUMENT, "unknown template format")),
+    }
+}
+/// Encode a JSON MultiViewRecord data handle into a JSON byte-array data handle.
+/// # Safety
+/// output must point to writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_template_encode_views(
+    handle: u64,
+    format: u32,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let format = template_format(format)?;
+        let record = read_data(handle)?;
+        let id = engine_data(crate::template_io::encode_views(&record, format))?;
+        unsafe { write(output, id) }
+    })
+}
+/// Decode a JSON byte-array data handle into a JSON MultiViewRecord data handle.
+/// # Safety
+/// output must point to writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_template_decode_views(
+    handle: u64,
+    format: u32,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let format = template_format(format)?;
+        let bytes: Vec<u8> = read_data(handle)?;
+        let id = engine_data(crate::template_io::decode_views(&bytes, format))?;
+        unsafe { write(output, id) }
+    })
+}
+/// Encode an ExtendedMultiViewRecord JSON handle, preserving opaque extension blocks.
+/// # Safety
+/// output must point to writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_template_encode_extended(
+    handle: u64,
+    format: u32,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let format = template_format(format)?;
+        let record = read_data(handle)?;
+        let id = engine_data(crate::template_io::encode_extended(&record, format))?;
+        unsafe { write(output, id) }
+    })
+}
+/// Decode a JSON byte-array handle into an owned ExtendedMultiViewRecord JSON handle.
+/// # Safety
+/// output must point to writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_template_decode_extended(
+    handle: u64,
+    format: u32,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let format = template_format(format)?;
+        let bytes: Vec<u8> = read_data(handle)?;
+        let id = engine_data(crate::template_io::decode_extended(&bytes, format))?;
+        unsafe { write(output, id) }
+    })
+}
+
+/// Encode explicit raw8 ANSI381 declarations into an owned JSON byte-array handle.
+/// # Safety
+/// output must point to writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_encode_ansi381(handle: u64, output: *mut u64) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let record = read_data(handle)?;
+        let id = engine_data(crate::ansi381::encode(&record))?;
+        unsafe { write(output, id) }
+    })
+}
+/// Decode an ANSI381 JSON byte-array handle into owned record declaration JSON.
+/// # Safety
+/// output must point to writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_decode_ansi381(handle: u64, output: *mut u64) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let bytes: Vec<u8> = read_data(handle)?;
+        let id = engine_data(crate::ansi381::decode(&bytes))?;
+        unsafe { write(output, id) }
+    })
+}
+/// Extract a zero-based raw view, retaining declared header scale.
+/// # Safety
+/// output must point to writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_ansi381_view(
+    handle: u64,
+    view: usize,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let record: crate::ansi381::Ansi381Record = read_data(handle)?;
+        let captured = record.raw_image(view).map_err(|e| mapped(IMAGE_ERROR, e))?;
+        let id = register_image(captured)?;
+        unsafe { write(output, id) }
+    })
+}
+
+/// Encode JSON MultiImageRecord declarations/payloads into a JSON byte-array handle.
+/// # Safety
+/// output must point to writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_encode_images(handle: u64, output: *mut u64) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let record = read_data(handle)?;
+        let id = engine_data(crate::image_record::encode_images(&record))?;
+        unsafe { write(output, id) }
+    })
+}
+/// Decode a JSON byte-array handle into JSON MultiImageRecord declarations/payloads.
+/// # Safety
+/// output must point to writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_decode_images(handle: u64, output: *mut u64) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let bytes: Vec<u8> = read_data(handle)?;
+        let id = engine_data(crate::image_record::decode_images(&bytes))?;
+        unsafe { write(output, id) }
+    })
+}
+
+/// Build a host correction profile from explicit dark and bright reference images.
+/// # Safety
+/// output must point to writable u64 storage. The returned JSON data handle is owned.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_flat_field_profile(
+    dark: u64,
+    bright: u64,
+    minimum_response: f64,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let dark = image(dark)?;
+        let bright = image(bright)?;
+        let profile = crate::processing::FlatFieldProfile::from_references(
+            &[crate::processing::FlatFieldReference {
+                label: "dark",
+                image: &dark.captured,
+            }],
+            &[crate::processing::FlatFieldReference {
+                label: "bright",
+                image: &bright.captured,
+            }],
+            crate::processing::FlatFieldConfig {
+                minimum_response,
+                maximum_response: 255.0,
+            },
+        )
+        .map_err(|e| mapped(IMAGE_ERROR, e))?;
+        let id = data(&profile)?;
+        unsafe { write(output, id) }
+    })
+}
+/// Apply a validated JSON correction profile to a borrowed image, returning a new image.
+/// # Safety
+/// output must point to writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_apply_flat_field(
+    handle: u64,
+    profile: u64,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let profile: crate::processing::FlatFieldProfile = read_data(profile)?;
+        let corrected = profile
+            .apply(&image(handle)?.captured)
+            .map_err(|e| mapped(IMAGE_ERROR, e))?;
+        let id = register_image(corrected)?;
+        unsafe { write(output, id) }
+    })
+}
+
 #[derive(Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AssessmentOptions {
@@ -1217,6 +1746,47 @@ fn data(value: &impl serde::Serialize) -> Result<u64> {
 fn engine_data<T: serde::Serialize>(value: anyhow::Result<T>) -> Result<u64> {
     data(&value.map_err(|e| mapped(IMAGE_ERROR, e))?)
 }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyAssessmentOptions {
+    engine_path: std::path::PathBuf,
+    timeout_ms: Option<u64>,
+    ppi: Option<f64>,
+}
+/// Return a separate legacy NFIQ 1 outcome; class 1 is best and 5 is worst.
+/// # Safety
+/// config must contain length readable JSON bytes; output must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_assess_nfiq1(
+    handle: u64,
+    config: *const u8,
+    length: usize,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let options: LegacyAssessmentOptions = unsafe { json_input(config, length)? };
+        let timeout = options.timeout_ms.unwrap_or(10_000);
+        if !(1..=300_000).contains(&timeout) {
+            return Err(error(INVALID_ARGUMENT, "engine deadline out of range"));
+        }
+        let mut captured = image(handle)?.captured.clone();
+        if let Some(ppi) = options.ppi {
+            captured.metadata.resolution = crate::metadata::Resolution::declared(ppi, ppi)
+                .map_err(|e| mapped(INVALID_ARGUMENT, e))?;
+        }
+        let outcome = quality::Nfiq1 {
+            executable: options.engine_path,
+            timeout: Duration::from_millis(timeout),
+        }
+        .assess(&captured);
+        let id = data(&outcome)?;
+        unsafe { write(output, id) }
+    })
+}
+
 /// Evaluate once and return an immutable report handle (so probing never reruns an engine).
 /// # Safety
 /// JSON must be readable for length bytes and output writable for a u64.
@@ -1252,6 +1822,50 @@ pub unsafe extern "C" fn uareu_image_assess(
         unsafe { write(output, handle) }
     })
 }
+/// Assess one declared raw image-record view; resolution is never overridden.
+/// # Safety
+/// config must contain length readable JSON bytes; output must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uareu_image_assess_record_view(
+    handle: u64,
+    view: usize,
+    config: *const u8,
+    length: usize,
+    output: *mut u64,
+) -> u32 {
+    boundary(|| {
+        unsafe {
+            write(output, 0)?;
+        }
+        let options: AssessmentOptions = unsafe { json_input(config, length)? };
+        let timeout = options.timeout_ms.unwrap_or(10_000);
+        if options.ppi.is_some() || !(1..=300_000).contains(&timeout) {
+            return Err(error(
+                INVALID_ARGUMENT,
+                "record assessment preserves declared scale; timeout must be 1..300000",
+            ));
+        }
+        let record: crate::image_record::MultiImageRecord = read_data(handle)?;
+        let outcome = if let Some(executable) = options.engine_path {
+            quality::Nfiq2 {
+                executable,
+                model_info: options.model_path,
+                timeout: Duration::from_millis(timeout),
+            }
+            .assess_record_view(&record, view)
+        } else {
+            match record.raw_image(view) {
+                Ok(_) => quality::QualityOutcome::NotEvaluated,
+                Err(error) => quality::QualityOutcome::UnsupportedInput {
+                    reason: format!("{error:#}"),
+                },
+            }
+        };
+        let id = data(&outcome)?;
+        unsafe { write(output, id) }
+    })
+}
+
 /// Explicit display enhancement creates a new image and preserves the original.
 /// # Safety
 /// output must point to writable u64 storage.
@@ -1599,6 +2213,282 @@ mod tests {
     use super::*;
     use std::ptr::null_mut;
 
+    #[test]
+    fn ansi381_c_api_roundtrip_raw_view_and_error_ownership() {
+        let input=data(&serde_json::json!({"cbeff_product_id":65537,"appendix_f_compliant":false,"record":{
+            "capture_device_id":1,"acquisition_level":10,"scale_units":1,"scan_resolution_x":500,"scan_resolution_y":500,
+            "image_resolution_x":500,"image_resolution_y":500,"compression":"raw8_bit","images":[{
+                "finger_position":1,"view_count":1,"view_number":1,"quality":254,"impression":0,"width":2,"height":2,"data":[0,255,128,64]
+            }]}})).unwrap();
+        let (mut bytes, mut record, mut image_id) = (99, 99, 99);
+        assert_eq!(unsafe { uareu_image_encode_ansi381(input, &mut bytes) }, OK);
+        assert_eq!(
+            unsafe { uareu_image_decode_ansi381(bytes, &mut record) },
+            OK
+        );
+        assert_eq!(
+            unsafe { uareu_image_ansi381_view(record, 0, &mut image_id) },
+            OK
+        );
+        assert_eq!(
+            image(image_id).unwrap().captured.image.pixels,
+            [0, 255, 128, 64]
+        );
+        let restored: serde_json::Value = read_data(record).unwrap();
+        assert_eq!(restored["record"]["images"][0]["quality"], 254);
+        let mut failed = 99;
+        assert_eq!(
+            unsafe { uareu_image_ansi381_view(record, 1, &mut failed) },
+            IMAGE_ERROR
+        );
+        assert_eq!(failed, 0);
+        let bad = data(&vec![0u8, 1, 2]).unwrap();
+        failed = 99;
+        assert_eq!(
+            unsafe { uareu_image_decode_ansi381(bad, &mut failed) },
+            IMAGE_ERROR
+        );
+        assert_eq!(failed, 0);
+        for id in [input, bytes, record, bad] {
+            assert_eq!(uareu_data_free(id), OK);
+        }
+        assert_eq!(uareu_image_free(image_id), OK);
+    }
+
+    #[test]
+    fn async_completion_c_api_validation_and_owned_delivery() {
+        use std::sync::mpsc;
+        unsafe extern "C" fn callback(
+            status: u32,
+            image: u64,
+            report: u64,
+            context: *mut std::ffi::c_void,
+        ) {
+            let send = unsafe { &*(context as *const mpsc::Sender<(u32, u64, u64)>) };
+            let _ = send.send((status, image, report));
+        }
+        let mut output = 99;
+        assert_eq!(
+            unsafe {
+                uareu_capture_start_with_completion(
+                    0,
+                    100,
+                    1,
+                    None,
+                    std::ptr::null_mut(),
+                    &mut output,
+                )
+            },
+            INVALID_ARGUMENT
+        );
+        assert_eq!(output, 0);
+        assert_eq!(
+            unsafe {
+                uareu_capture_start_with_completion(
+                    0,
+                    100,
+                    1,
+                    Some(callback),
+                    std::ptr::null_mut(),
+                    &mut output,
+                )
+            },
+            INVALID_HANDLE
+        );
+        assert_eq!(output, 0);
+        let (send, receive) = mpsc::channel::<(u32, u64, u64)>();
+        let context = &send as *const _ as usize;
+        for fails in [false, true] {
+            start_callback_operation(
+                Arc::new(AtomicBool::new(false)),
+                move |_| {
+                    if fails {
+                        Err(CaptureError::new(
+                            CaptureErrorKind::Cancelled,
+                            CaptureStage::FingerWait,
+                            "injected cancellation",
+                        )
+                        .into())
+                    } else {
+                        Ok(CapturedImage::new(crate::frame::Image {
+                            width: 1,
+                            height: 1,
+                            pixels: vec![17],
+                        }))
+                    }
+                },
+                callback,
+                context,
+                &mut output,
+            )
+            .unwrap();
+            let (status, image_id, report) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            if fails {
+                assert_eq!((status, image_id), (CANCELLED, 0));
+                let json: serde_json::Value = read_data(report).unwrap();
+                assert_eq!(json["kind"], "cancelled");
+                assert_eq!(uareu_data_free(report), OK);
+            } else {
+                assert_eq!((status, report), (OK, 0));
+                assert_eq!(image(image_id).unwrap().captured.image.pixels, [17]);
+                assert_eq!(uareu_image_free(image_id), OK);
+            }
+            assert!(task(output).unwrap().status().consumed);
+            assert_eq!(uareu_task_free(output), OK);
+            assert_eq!(uareu_task_free(output), INVALID_HANDLE);
+        }
+    }
+
+    #[test]
+    fn async_completion_reentrant_free_is_busy_without_removing_task() {
+        struct Context {
+            job: std::sync::mpsc::Receiver<u64>,
+            result: std::sync::mpsc::Sender<(u32, bool, String)>,
+        }
+        unsafe extern "C" fn callback(
+            _status: u32,
+            _image: u64,
+            report: u64,
+            context: *mut std::ffi::c_void,
+        ) {
+            let context = unsafe { &*(context as *const Context) };
+            if let Ok(id) = context.job.recv_timeout(Duration::from_secs(2)) {
+                let status = uareu_task_free(id);
+                let exists = task(id).is_ok();
+                let kind = LAST_ERROR.with(|last| last.borrow().kind.clone());
+                let _ = context.result.send((status, exists, kind));
+            }
+            if report != 0 {
+                uareu_data_free(report);
+            }
+        }
+        let (job_send, job_receive) = std::sync::mpsc::channel();
+        let (send, receive) = std::sync::mpsc::channel();
+        let context = Box::new(Context {
+            job: job_receive,
+            result: send,
+        });
+        let mut id = 0;
+        start_callback_operation(
+            Arc::new(AtomicBool::new(false)),
+            |_| Err(anyhow::anyhow!("injected")),
+            callback,
+            &*context as *const _ as usize,
+            &mut id,
+        )
+        .unwrap();
+        job_send.send(id).unwrap();
+        assert_eq!(
+            receive.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (BUSY, true, "busy".to_owned())
+        );
+        assert_eq!(uareu_task_free(id), OK);
+        drop(context);
+    }
+
+    #[test]
+    fn legacy_quality_c_api_keeps_scale_unknown_and_rejects_bad_config() {
+        let input = register_image(CapturedImage::new(crate::frame::Image {
+            width: 2,
+            height: 1,
+            pixels: vec![0, 255],
+        }))
+        .unwrap();
+        let config = br#"{"engine_path":"missing-nfiq"}"#;
+        let mut report = 99;
+        assert_eq!(
+            unsafe { uareu_image_assess_nfiq1(input, config.as_ptr(), config.len(), &mut report) },
+            OK
+        );
+        let json: serde_json::Value = read_data(report).unwrap();
+        assert_eq!(json["status"], "unsupported_input");
+        assert_eq!(
+            image(input).unwrap().captured.metadata.resolution,
+            crate::metadata::Resolution::Unknown
+        );
+        assert_eq!(uareu_data_free(report), OK);
+        for config in [
+            br#"{"engine_path":"missing-nfiq","timeout_ms":0}"#.as_slice(),
+            br#"{"engine_path":"missing-nfiq","model_path":"model"}"#,
+        ] {
+            report = 99;
+            assert_eq!(
+                unsafe {
+                    uareu_image_assess_nfiq1(input, config.as_ptr(), config.len(), &mut report)
+                },
+                INVALID_ARGUMENT
+            );
+            assert_eq!(report, 0);
+        }
+        assert_eq!(uareu_image_free(input), OK);
+    }
+
+    #[test]
+    fn jpeg2000_c_api_rejects_bad_deadline_and_codestream_without_outputs() {
+        let mut output = 99;
+        let invalid = br#"{"encoder":"missing","decoder":"missing","timeout_ms":0}"#;
+        assert_eq!(
+            unsafe { uareu_image_encode_jpeg2000(0, invalid.as_ptr(), invalid.len(), &mut output) },
+            INVALID_ARGUMENT
+        );
+        assert_eq!(output, 0);
+        let valid = br#"{"encoder":"missing","decoder":"missing"}"#;
+        let bytes = data(&vec![0u8, 1, 2]).unwrap();
+        output = 99;
+        assert_eq!(
+            unsafe { uareu_image_decode_jpeg2000(bytes, valid.as_ptr(), valid.len(), &mut output) },
+            IMAGE_ERROR
+        );
+        assert_eq!(output, 0);
+        assert_eq!(uareu_data_free(bytes), OK);
+    }
+
+    #[test]
+    fn extended_template_c_api_roundtrips_and_clears_failed_outputs() {
+        let input = data(&serde_json::json!({
+            "record": {"width":20,"height":20,"pixels_per_cm_x":197,"pixels_per_cm_y":197,
+                "vendor_id":1,"subformat":0,"device_info":0,
+                "views":[{"finger_position":1,"view_number":0,"impression":0,"quality":80,"minutiae":[]}]},
+            "extensions":[[{"type_code":257,"data":[0,255,17]}]]
+        })).unwrap();
+        for format in [0, 1] {
+            let (mut bytes, mut restored) = (99, 99);
+            assert_eq!(
+                unsafe { uareu_template_encode_extended(input, format, &mut bytes) },
+                OK
+            );
+            assert_eq!(
+                unsafe { uareu_template_decode_extended(bytes, format, &mut restored) },
+                OK
+            );
+            let json: serde_json::Value = read_data(restored).unwrap();
+            assert_eq!(
+                json["extensions"][0][0]["data"],
+                serde_json::json!([0, 255, 17])
+            );
+            let mut failed = 99;
+            assert_eq!(
+                unsafe { uareu_template_decode_views(bytes, format, &mut failed) },
+                IMAGE_ERROR
+            );
+            assert_eq!(failed, 0);
+            assert_eq!(
+                unsafe { uareu_template_decode_extended(bytes, 99, &mut failed) },
+                INVALID_ARGUMENT
+            );
+            assert_eq!(failed, 0);
+            assert_eq!(uareu_data_free(bytes), OK);
+            assert_eq!(uareu_data_free(restored), OK);
+        }
+        assert_eq!(uareu_data_free(input), OK);
+        let mut failed = 99;
+        assert_eq!(
+            unsafe { uareu_template_encode_extended(input, 0, &mut failed) },
+            INVALID_HANDLE
+        );
+        assert_eq!(failed, 0);
+    }
+
     fn last_error() -> String {
         let mut required = 0;
         assert_eq!(
@@ -1611,6 +2501,211 @@ mod tests {
             OK
         );
         String::from_utf8(bytes[..bytes.len() - 1].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn flat_field_c_api_preserves_inputs_and_rejects_invalid_profiles() {
+        let dark = register_image(crate::metadata::CapturedImage::new(crate::frame::Image {
+            width: 2,
+            height: 1,
+            pixels: vec![10, 20],
+        }))
+        .unwrap();
+        let bright = register_image(crate::metadata::CapturedImage::new(crate::frame::Image {
+            width: 2,
+            height: 1,
+            pixels: vec![110, 220],
+        }))
+        .unwrap();
+        let input = register_image(crate::metadata::CapturedImage::new(crate::frame::Image {
+            width: 2,
+            height: 1,
+            pixels: vec![60, 120],
+        }))
+        .unwrap();
+        let (mut profile, mut corrected) = (99, 99);
+        assert_eq!(
+            unsafe { uareu_image_flat_field_profile(dark, bright, 8.0, &mut profile) },
+            OK
+        );
+        assert_eq!(
+            unsafe { uareu_image_apply_flat_field(input, profile, &mut corrected) },
+            OK
+        );
+        assert_eq!(image(input).unwrap().captured.image.pixels, [60, 120]);
+        assert_eq!(image(corrected).unwrap().captured.image.pixels, [128, 128]);
+        let bad = data(&serde_json::json!({})).unwrap();
+        let mut failed = 99;
+        assert_ne!(
+            unsafe { uareu_image_apply_flat_field(input, bad, &mut failed) },
+            OK
+        );
+        assert_eq!(failed, 0);
+        assert_ne!(
+            unsafe { uareu_image_flat_field_profile(dark, bright, 0.0, &mut failed) },
+            OK
+        );
+        assert_eq!(failed, 0);
+        for id in [profile, bad] {
+            assert_eq!(uareu_data_free(id), OK);
+        }
+        for id in [dark, bright, input, corrected] {
+            assert_eq!(uareu_image_free(id), OK);
+        }
+    }
+    #[test]
+    fn record_view_assessment_rejects_opaque_without_codec_or_resolution_override() {
+        let record = serde_json::json!({"capture_device_id":1,"acquisition_level":0,"scale_units":1,"scan_resolution_x":500,"scan_resolution_y":500,"image_resolution_x":500,"image_resolution_y":500,"compression":"opaque_wsq","images":[{"finger_position":1,"view_count":1,"view_number":1,"quality":80,"impression":0,"width":2,"height":2,"data":[0,1,2]}]});
+        let input = data(&record).unwrap();
+        let config = br#"{"engine_path":"missing"}"#;
+        let mut output = 99;
+        assert_eq!(
+            unsafe {
+                uareu_image_assess_record_view(input, 0, config.as_ptr(), config.len(), &mut output)
+            },
+            OK
+        );
+        let result: serde_json::Value = read_data(output).unwrap();
+        assert_eq!(result["status"], "unsupported_input");
+        assert!(result["reason"].as_str().unwrap().contains("compressed"));
+        assert_eq!(uareu_data_free(output), OK);
+        let config = br#"{"ppi":500}"#;
+        assert_eq!(
+            unsafe {
+                uareu_image_assess_record_view(input, 0, config.as_ptr(), config.len(), &mut output)
+            },
+            INVALID_ARGUMENT
+        );
+        assert_eq!(output, 0);
+        assert_eq!(uareu_data_free(input), OK);
+    }
+
+    #[test]
+    fn target_wsq_rejects_bounds_before_image_lookup_or_codec() {
+        for config in [
+            serde_json::json!({"encoder":"missing","decoder":"missing","target_bytes":0}),
+            serde_json::json!({"encoder":"missing","decoder":"missing","target_bytes":4194305}),
+            serde_json::json!({"encoder":"missing","decoder":"missing","target_bytes":1024,"max_encodes":0}),
+            serde_json::json!({"encoder":"missing","decoder":"missing","target_bytes":1024,"max_encodes":33}),
+            serde_json::json!({"encoder":"missing","decoder":"missing","target_bytes":1024,"timeout_ms":0}),
+        ] {
+            let json = serde_json::to_vec(&config).unwrap();
+            let mut output = 99;
+            assert_eq!(
+                unsafe { uareu_image_encode_wsq_target(0, json.as_ptr(), json.len(), &mut output) },
+                INVALID_ARGUMENT
+            );
+            assert_eq!(output, 0);
+        }
+    }
+
+    #[test]
+    fn status_wait_releases_state_lock_and_observes_changes() {
+        let state = Arc::new(Mutex::new(ReaderState {
+            closed: false,
+            idle_reader: None,
+            active: None,
+            monitor: ReaderMonitor::default(),
+            persistent: false,
+        }));
+        let sequence = state.lock().unwrap().monitor.snapshot().sequence;
+        assert!(wait_reader_status(&state, sequence, 0).unwrap().is_none());
+        let waiter_state = Arc::clone(&state);
+        let waiter = std::thread::spawn(move || {
+            wait_reader_status(&waiter_state, sequence, 1000)
+                .unwrap()
+                .unwrap()
+        });
+        state.lock().unwrap().monitor.begin();
+        let observed = waiter.join().unwrap();
+        assert!(observed.sequence > sequence);
+        assert!(observed.capture_active);
+        let sequence = observed.sequence;
+        let waiter_state = Arc::clone(&state);
+        let waiter = std::thread::spawn(move || wait_reader_status(&waiter_state, sequence, 1000));
+        state.lock().unwrap().close();
+        match waiter.join().unwrap() {
+            Ok(Some(observed)) => {
+                assert_eq!(observed.operation, crate::reader::ReaderOperation::Closed)
+            }
+            Err(Error(INVALID_HANDLE, _, _)) => (), // close preceded initial handle lookup
+            other => panic!("unexpected close result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn additive_record_abi_roundtrips_and_zeroes_failures() {
+        let views = serde_json::json!({"width":20,"height":20,"pixels_per_cm_x":197,"pixels_per_cm_y":197,"vendor_id":0,"subformat":0,"device_info":0,"views":[{"finger_position":1,"view_number":0,"impression":0,"quality":80,"minutiae":[]},{"finger_position":1,"view_number":1,"impression":0,"quality":70,"minutiae":[]}]});
+        for format in [0, 1] {
+            let mut views = views.clone();
+            views["vendor_id"] = serde_json::json!(format);
+            let input = data(&views).unwrap();
+            let mut encoded = 99;
+            let mut decoded = 99;
+            assert_eq!(
+                unsafe { uareu_template_encode_views(input, format, &mut encoded) },
+                OK
+            );
+            assert_eq!(
+                unsafe { uareu_template_decode_views(encoded, format, &mut decoded) },
+                OK
+            );
+            assert_eq!(read_data::<serde_json::Value>(decoded).unwrap(), views);
+            for handle in [input, encoded, decoded] {
+                assert_eq!(uareu_data_free(handle), OK);
+                assert_eq!(uareu_data_free(handle), INVALID_HANDLE);
+            }
+        }
+        let record = serde_json::json!({"capture_device_id":1,"acquisition_level":0,"scale_units":1,"scan_resolution_x":500,"scan_resolution_y":500,"image_resolution_x":500,"image_resolution_y":500,"compression":"raw8_bit","images":[{"finger_position":1,"view_count":2,"view_number":1,"quality":80,"impression":0,"width":2,"height":2,"data":[0,255,128,64]},{"finger_position":1,"view_count":2,"view_number":2,"quality":70,"impression":0,"width":2,"height":2,"data":[64,128,255,0]}]});
+        let input = data(&record).unwrap();
+        let mut encoded = 99;
+        let mut decoded = 99;
+        assert_eq!(
+            unsafe { uareu_image_encode_images(input, &mut encoded) },
+            OK
+        );
+        assert_eq!(
+            unsafe { uareu_image_decode_images(encoded, &mut decoded) },
+            OK
+        );
+        assert_eq!(read_data::<serde_json::Value>(decoded).unwrap(), record);
+        for handle in [input, encoded, decoded] {
+            assert_eq!(uareu_data_free(handle), OK);
+        }
+        let malformed = data(&vec![0u8, 1, 2]).unwrap();
+        for format in [0, 1] {
+            let mut output = 99;
+            assert_eq!(
+                unsafe { uareu_template_decode_views(malformed, format, &mut output) },
+                IMAGE_ERROR
+            );
+            assert_eq!(output, 0);
+        }
+        let mut output = 99;
+        assert_eq!(
+            unsafe { uareu_image_decode_images(malformed, &mut output) },
+            IMAGE_ERROR
+        );
+        assert_eq!(output, 0);
+        output = 99;
+        assert_eq!(
+            unsafe { uareu_template_encode_views(malformed, 2, &mut output) },
+            INVALID_ARGUMENT
+        );
+        assert_eq!(output, 0);
+        assert_eq!(uareu_data_free(malformed), OK);
+        assert_eq!(
+            unsafe { uareu_image_encode_images(0, &mut output) },
+            INVALID_HANDLE
+        );
+        assert_eq!(output, 0);
+        let mut completed = 99;
+        output = 99;
+        assert_eq!(
+            unsafe { uareu_reader_wait_status_json(0, 0, 0, &mut completed, &mut output) },
+            INVALID_HANDLE
+        );
+        assert_eq!((completed, output), (0, 0));
     }
 
     #[test]
