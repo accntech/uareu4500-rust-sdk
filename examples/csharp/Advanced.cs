@@ -5,7 +5,7 @@ using System.Text.Json;
 
 internal static class Advanced
 {
-    internal static readonly HashSet<string> Commands = ["--advanced-test", "--recognition-test", "--session-test", "--async-test", "--continuous", "--capture-async", "--quality", "--enhance", "--extract", "--compare", "--enroll", "--identify", "--verify-enrollment", "--export-template", "--import-template", "--wsq-encode", "--wsq-decode", "--probe", "--recover", "--image-record-encode", "--image-record-decode"];
+    internal static readonly HashSet<string> Commands = ["--hardware-acceptance", "--hardware-acceptance-self-test", "--advanced-test", "--recognition-test", "--session-test", "--async-test", "--continuous", "--capture-async", "--quality", "--enhance", "--extract", "--compare", "--enroll", "--identify", "--verify-enrollment", "--export-template", "--import-template", "--wsq-encode", "--wsq-decode", "--probe", "--recover", "--image-record-encode", "--image-record-decode"];
     private sealed class Handles : IDisposable
     {
         private readonly List<(ulong Value, bool Image)> items = [];
@@ -47,6 +47,8 @@ internal static class Advanced
         using Handles handles = new();
         switch (args[0])
         {
+            case "--hardware-acceptance": return await HardwareAcceptance.Run(args[1..]);
+            case "--hardware-acceptance-self-test": return HardwareAcceptance.RunSelfTests();
             case "--advanced-test": OfflineTest(handles); return 0;
             case "--recognition-test" when args.Length == 2: RecognitionTest(args[1], handles); return 0;
             case "--session-test": SessionTest(); return 0;

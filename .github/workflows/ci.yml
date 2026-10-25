@@ -20,6 +20,9 @@ jobs:
       - run: cargo test --locked --workspace --all-targets
       - run: cargo test --locked --workspace --doc
       - run: cargo build --locked --release
+      - name: Verify macOS native library loading
+        if: runner.os == 'macOS'
+        run: python3 scripts/test-macos-dylib.py target/release/libuareu.dylib
       - uses: actions/setup-dotnet@v4
         if: runner.os == 'Windows'
         with:
@@ -28,3 +31,11 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/test-windows-dll.ps1
+      - name: Verify reader harness without hardware
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-reader-acceptance.ps1 -SelfTest
+      - name: Verify experimental Windows source inventory
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-windows-sdk.ps1 -SelfTest

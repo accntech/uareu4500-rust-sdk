@@ -9,6 +9,7 @@ internal static class Program
     {
         try
         {
+            if (args is ["--hardware-acceptance-self-test"]) return HardwareAcceptance.RunSelfTests();
             string? dllPath = Environment.GetEnvironmentVariable("UAREU_DLL_PATH");
             if (!string.IsNullOrWhiteSpace(dllPath))
             {
