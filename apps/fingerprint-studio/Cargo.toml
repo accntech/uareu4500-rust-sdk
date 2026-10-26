@@ -1,0 +1,12 @@
+[package]
+name = "fingerprint-studio"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "GPUI fingerprint capture and in-memory enrollment example"
+
+[dependencies]
+anyhow = "1.0.104"
+gpui = { git = "https://github.com/zed-industries/zed", rev = "cc9af8d036270ad39953e6bc26e5167f84989af3", version = "0.2.1", features = ["runtime_shaders"] }
+image = { version = "0.25", default-features = false }
+uareu = { version = "0.1.0", path = "../.." }

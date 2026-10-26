@@ -27,6 +27,6 @@ name = "uareu"
 path = "src/main.rs"
 
 [workspace]
-members = ["xtask"]
+members = ["apps/fingerprint-studio", "xtask"]
 default-members = ["."]
 resolver = "3"

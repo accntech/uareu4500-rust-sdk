@@ -511,3 +511,10 @@ and authoritative resolution cannot be inferred from successful USB capture.
 The [latest implementation gap review](docs/IMPLEMENTATION_GAPS.md) maps remaining
 functionality to the supplied vendor headers and lists the outstanding validation
 work and recommended next steps.
+
+## GPUI desktop example
+
+[Fingerprint Studio](apps/fingerprint-studio/README.md) provides a custom native
+window/titlebar, USB capture and preview, and optional local enrollment and
+verification. Run `cargo run -p fingerprint-studio`; matching requires the local
+recognition helper and an explicitly declared, confirmed pixel scale.
