@@ -89,6 +89,23 @@ Templates retain engine version/build hashes, source scale, region, processing
 and optional image hash. Hashes describe provenance, not engine trust. Native
 caches are version bound; preserve original images for future extraction.
 
+Identification and enrollment verification batch comparisons when the serialized
+request fits 16 MiB. The helper prepares the probe once and returns ordered
+scores; Rust retains thresholding, stable ranking and maximum-score policy.
+Requests above the aggregate limit keep the previous per-comparison path, with
+the same overall deadline. There is no persistent matcher process.
+
+The private `compare` request keeps `probe` and `candidate` and optionally adds
+`additional_candidates`. Updated helpers return the existing `result.score`
+plus ordered `result.additional_scores`. Old SDKs still use updated helpers.
+An older helper ignores the additional request field; a valid response without
+`additional_scores` retains its first score and processes the remainder through
+the old path. Malformed batch scores, engine mismatch, process failure and
+timeouts fail the operation rather than triggering a retry. The gallery remains
+limited to 1000 candidates and each request/response remains bounded to 16 MiB.
+
+See [recorded synthetic throughput checks](../../docs/validation/recognition-performance.md).
+
 ## Interchange
 
 `--export-template TEMPLATE.json OUT.fmr FORMAT QUALITY IMPRESSION ENGINE` and

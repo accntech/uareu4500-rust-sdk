@@ -496,21 +496,64 @@ advisory image feedback, opt-in contrast enhancement, cached optional NFIQ 2 rep
 and an optional local SourceAFIS helper for extraction, comparison, identification,
 and multi-template enrollment. Existing capture entry points remain available.
 
-Supported interchange is deliberately bounded: single-view ISO 19794-2:2005 and
-ANSI 378:2004 minutiae records, and single-view raw 8-bit ISO 19794-4:2005 image
-records. WSQ uses separately supplied NBIS executables; its actual codec round trip
-has not been verified here. These features do not establish standards certification
-or matching accuracy. Recognition and export require declared or verified scale;
+Supported interchange includes editable multiview ISO 19794-2:2005 and ANSI
+378:2004 minutiae records, plus multiple raw or opaque compressed images in the
+ISO 19794-4:2005 subset. Selected minutiae records passed bidirectional checks
+against independent FingerprintIO. Optional external NBIS tools passed actual WSQ
+encode/decode, measured target-size search, and multiimage record checks. Optional
+NFIQ 2 passed a direct CLI comparison on a NIST synthetic example. These checks
+establish the recorded integration behavior; standards certification and matching
+accuracy remain open. Recognition and export require declared or verified scale;
 this reader's captured output DPI remains unknown.
+
+The SDK also offers incremental multi-template enrollment, status-change waits
+with OS unplug observation, and explicit-reference host flat-field correction.
+Their contracts and individual verification results are recorded in the
+[gap implementation ledger](docs/validation/gap-implementation-status.md).
 
 See [advanced SDK usage and gap matrix](examples/engine/README.md) for build commands,
 ownership rules, format limits, tests, and unavailable vendor features. Device
-readiness, calibration, liveness, PIV, image correction, additional reader models,
+readiness, hardware calibration, liveness, PIV, additional reader models,
 and authoritative resolution cannot be inferred from successful USB capture.
 
 The [latest implementation gap review](docs/IMPLEMENTATION_GAPS.md) maps remaining
-functionality to the supplied vendor headers and lists the outstanding validation
+functionality to the referenced vendor API families and lists the outstanding validation
 work and recommended next steps.
+
+## Validation and experimental tooling
+
+The [validation index](docs/validation/README.md) records implementation checks
+separately from physical reader, scale, interoperability and biometric acceptance.
+Use the [offline evaluator](docs/validation/recognition-evaluation.md) for an
+explicitly authorized known-scale corpus; it selects no production threshold.
+The [Windows reader harness](docs/validation/reader-acceptance.md) records actual
+lifecycle cases and inconclusive phase interruptions. The [experimental Windows
+packager](docs/validation/windows-package.md) freezes approved source inputs and
+verifies rebuilding the extracted source; it does not install drivers or bundle
+the DigitalPersona runtime, NBIS or NFIQ. Those Windows scripts still require
+execution on Windows before their runtime/package gates can pass.
+
+### Additional optional features verified 2026-10-26
+
+The SDK now preserves typed opaque ANSI/ISO minutiae extension envelopes,
+encodes/decodes lossless grayscale raw JPEG2000 through external OpenJPEG tools,
+and assesses legacy NFIQ1 through external NBIS5. Legacy scores use a separate
+1..5 lower-is-better result; they are never NFIQ2 scores. Raw J2K decoding cannot
+supply physical DPI. Existing strict/no-extension APIs retain their behavior.
+See [remaining features and verification](docs/IMPLEMENTATION_GAPS.md),
+[extension transport](docs/validation/template-extensions.md),
+[JPEG2000](docs/validation/jpeg2000.md) and [NFIQ1](docs/validation/nfiq1.md).
+
+### Online-reference additions verified 2026-10-26
+
+New independent APIs provide [ANSI381 raw8 image records](docs/validation/ansi381.md)
+and [worker completion callbacks](docs/validation/async-completion.md). Reader
+status can retain the existing register-f0 raw identity block without inferring
+hardware/firmware version meanings or adding USB requests. The online search
+found [modern reference headers and a vendor guide](docs/validation/online-sdk-contracts.md);
+these are reference inputs, not vendor binaries or binary-compatibility claims.
+[Remaining gaps](docs/IMPLEMENTATION_GAPS.md) distinguish completed software from
+verified device behavior and physical acceptance still needed.
 
 ## GPUI desktop example
 
