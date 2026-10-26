@@ -24,6 +24,23 @@ pub struct EnrollmentProgress {
     pub minimum_pair_score: Option<f64>,
 }
 
+/// A retryable mismatch; process and validation failures remain separate errors.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EnrollmentRejection {
+    pub score: f64,
+    pub threshold: f64,
+}
+impl std::fmt::Display for EnrollmentRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "inconsistent enrollment samples: score {} is below {}",
+            self.score, self.threshold
+        )
+    }
+}
+impl std::error::Error for EnrollmentRejection {}
+
 /// Owns accepted template copies only. No persistent process, device, or worker
 /// is retained. Each add finishes its helper processes before returning.
 #[derive(Debug)]
@@ -98,10 +115,13 @@ impl EnrollmentSession {
             let score = *scores
                 .first()
                 .context("missing enrollment comparison score")?;
-            ensure!(
-                score >= self.config.consistency_threshold,
-                "inconsistent enrollment samples"
-            );
+            if score < self.config.consistency_threshold {
+                return Err(EnrollmentRejection {
+                    score,
+                    threshold: self.config.consistency_threshold,
+                }
+                .into());
+            }
             minimum = Some(minimum.map_or(score, |previous| previous.min(score)));
         }
         self.samples.push(sample.clone());

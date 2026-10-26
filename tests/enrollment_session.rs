@@ -193,10 +193,23 @@ fn inconsistent_or_failed_add_is_transactional_and_reset_clears_progress() {
     let mut session = EnrollmentSession::new(config()).unwrap();
     session.add(&h.engine, &template(20)).unwrap();
     let before = session.progress();
-    assert!(session.add(&h.engine, &template(1)).is_err());
+    let rejection = session.add(&h.engine, &template(1)).unwrap_err();
+    assert!(
+        rejection.to_string().contains("score 1"),
+        "rejection must retain its score: {rejection}"
+    );
+    assert!(
+        rejection.to_string().contains("10"),
+        "rejection must retain its threshold: {rejection}"
+    );
+    let mismatch = rejection
+        .downcast_ref::<uareu::recognition::enrollment::EnrollmentRejection>()
+        .unwrap();
+    assert_eq!((mismatch.score, mismatch.threshold), (1.0, 10.0));
     assert_eq!(session.progress(), before);
     h.mode("failure");
-    assert!(session.add(&h.engine, &template(30)).is_err());
+    let failure = session.add(&h.engine, &template(30)).unwrap_err();
+    assert!(!failure.is::<uareu::recognition::enrollment::EnrollmentRejection>());
     assert_eq!(session.progress(), before);
     h.mode("new");
     session.add(&h.engine, &template(30)).unwrap();

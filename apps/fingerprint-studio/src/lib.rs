@@ -11,7 +11,10 @@ pub mod theme;
 pub mod workflow;
 use uareu::{
     metadata::{CapturedImage, Resolution},
-    recognition::{Enrollment, FingerprintTemplate, MatchResult, RecognitionEngine},
+    recognition::{
+        Enrollment, EnrollmentConfig, EnrollmentSession, MatchResult, RecognitionEngine,
+        enrollment::EnrollmentRejection,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -103,31 +106,35 @@ pub enum SampleAcceptance {
 pub struct Session {
     pub capture: Option<CapturedImage>,
     config: Config,
-    samples: Vec<FingerprintTemplate>,
+    pending_enrollment: Option<EnrollmentSession>,
     enrollment: Option<Enrollment>,
     sample_available: bool,
-    minimum_pair_score: Option<f64>,
 }
 impl Session {
     pub fn new(config: Config) -> Self {
         Self {
             capture: None,
             config,
-            samples: Vec::new(),
+            pending_enrollment: None,
             enrollment: None,
             sample_available: false,
-            minimum_pair_score: None,
         }
     }
     pub fn reset(&mut self) {
         self.capture = None;
-        self.samples.clear();
-        self.minimum_pair_score = None;
+        self.pending_enrollment = None;
         self.enrollment = None;
         self.sample_available = false;
     }
     pub fn sample_count(&self) -> usize {
-        self.samples.len()
+        self.enrollment.as_ref().map_or_else(
+            || {
+                self.pending_enrollment
+                    .as_ref()
+                    .map_or(0, |session| session.progress().accepted_samples)
+            },
+            |enrollment| enrollment.samples.len(),
+        )
     }
     pub fn enrolled(&self) -> bool {
         self.enrollment.is_some()
@@ -161,7 +168,7 @@ impl Session {
             "Capture a new impression before adding a sample."
         );
         ensure!(
-            self.samples.len() < 3,
+            !self.enrolled(),
             "Enrollment complete. Clear the session to enroll another finger."
         );
         let started = Instant::now();
@@ -171,38 +178,48 @@ impl Session {
                 .as_ref()
                 .context("Capture a fingerprint first.")?,
         )?;
-        let mut minimum = self.minimum_pair_score;
-        for accepted in &self.samples {
-            let remaining = engine.timeout.saturating_sub(started.elapsed());
-            ensure!(!remaining.is_zero(), "Enrollment timed out.");
-            let bounded = RecognitionEngine {
-                executable: engine.executable.clone(),
-                timeout: remaining,
-            };
-            let result = bounded.compare(accepted, &sample, self.config.threshold)?;
-            if !result.matched {
-                self.sample_available = false;
-                return Ok(SampleAcceptance::Rejected {
-                    score: result.score,
-                    threshold: result.threshold,
-                });
-            }
-            minimum = Some(minimum.map_or(result.score, |previous| previous.min(result.score)));
-        }
-        self.samples.push(sample);
-        self.minimum_pair_score = minimum;
-        if self.samples.len() == 3 {
-            self.enrollment = Some(Enrollment {
-                schema_version: 1,
-                policy: "all_pairs_consistent_multi_template_not_vendor_fusion".into(),
-                samples: self.samples.clone(),
+        let remaining = engine.timeout.saturating_sub(started.elapsed());
+        ensure!(!remaining.is_zero(), "Enrollment timed out.");
+        let bounded = RecognitionEngine {
+            timeout: remaining,
+            ..engine
+        };
+        if self.pending_enrollment.is_none() {
+            self.pending_enrollment = Some(EnrollmentSession::new(EnrollmentConfig {
+                min_samples: 3,
+                max_samples: 3,
                 consistency_threshold: self.config.threshold,
-                minimum_pair_score: minimum.context("Enrollment lacks pair measurements")?,
-            });
+            })?);
+        }
+        let pending = self
+            .pending_enrollment
+            .as_mut()
+            .expect("enrollment initialized");
+        let progress = match pending.add(&bounded, &sample) {
+            Ok(progress) => progress,
+            Err(error) => {
+                if let Some(rejection) = error.downcast_ref::<EnrollmentRejection>() {
+                    self.sample_available = false;
+                    return Ok(SampleAcceptance::Rejected {
+                        score: rejection.score,
+                        threshold: rejection.threshold,
+                    });
+                }
+                return Err(error);
+            }
+        };
+        if progress.ready {
+            self.enrollment = Some(
+                self.pending_enrollment
+                    .take()
+                    .expect("ready enrollment")
+                    .finish()?,
+            );
         }
         self.sample_available = false;
-        Ok(SampleAcceptance::Accepted(self.samples.len()))
+        Ok(SampleAcceptance::Accepted(progress.accepted_samples))
     }
+
     pub fn verify(&mut self) -> Result<MatchResult> {
         ensure!(
             self.sample_available,

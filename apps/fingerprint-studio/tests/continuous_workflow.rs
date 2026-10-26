@@ -93,9 +93,16 @@ fn inconsistency_is_retryable_but_helper_failure_is_fatal_without_losing_samples
     session.set_capture(captured(60)).unwrap();
     assert!(matches!(
         session.try_add_sample().unwrap(),
-        SampleAcceptance::Rejected { .. }
+        SampleAcceptance::Rejected {
+            score: 5.0,
+            threshold: 40.0
+        }
     ));
     assert_eq!(session.sample_count(), 1);
+    assert!(
+        session.try_add_sample().is_err(),
+        "a rejected image cannot be reused"
+    );
     session.set_capture(captured(99)).unwrap();
     assert!(session.try_add_sample().is_err());
     assert_eq!(session.sample_count(), 1);
