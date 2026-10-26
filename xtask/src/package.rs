@@ -95,8 +95,8 @@ fn project_paths(root: &Path, vendor: bool) -> Result<BTreeMap<String, PathBuf>>
     for (group, extensions) in [
         ("src", &["rs"][..]),
         ("include", &["h"][..]),
-        ("examples", &["c", "cs", "csproj"][..]),
-        ("tests", &["rs", "c"][..]),
+        ("examples", &["rs", "c", "cs", "csproj"][..]),
+        ("tests", &["rs", "c", "java"][..]),
         ("scripts", &["ps1", "py"][..]),
         ("xtask/src", &["rs"][..]),
         ("fixtures", &["wire", "gray"][..]),
@@ -174,6 +174,61 @@ fn check_dependency_table(value: &toml::Value) -> Result<()> {
     }
     Ok(())
 }
+fn reduce_release_workspace(root: &Path) -> Result<()> {
+    let manifest_path = root.join("Cargo.toml");
+    let mut manifest = parse(&manifest_path)?;
+    let Some(workspace) = manifest.get_mut("workspace") else {
+        return Ok(());
+    };
+    let members = workspace
+        .get_mut("members")
+        .and_then(toml::Value::as_array_mut)
+        .context("release workspace must declare its members")?;
+    for member in members.iter() {
+        if !matches!(member.as_str(), Some("xtask" | "apps/fingerprint-studio")) {
+            bail!("unsupported release workspace member {member}; update the source inventory");
+        }
+    }
+    // The source archive builds the CLI/SDK and release tooling, not the desktop app.
+    members.retain(|member| member.as_str() != Some("apps/fingerprint-studio"));
+    if let Some(defaults) = workspace
+        .get_mut("default-members")
+        .and_then(toml::Value::as_array_mut)
+    {
+        defaults.retain(|member| member.as_str() != Some("apps/fingerprint-studio"));
+    }
+    fs::write(manifest_path, toml::to_string(&manifest)?)?;
+
+    let lock_path = root.join("Cargo.lock");
+    let original = parse(&lock_path)?;
+    let original_packages = original
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .context("lockfile has no packages")?;
+    // Unvendored snapshots may need registry metadata absent from an xtask-only
+    // cache. Vendored rebuilds stay offline; retained package identities stay pinned.
+    let mut args = vec!["update", "--workspace"];
+    if root.join("vendor").is_dir() {
+        args.push("--offline");
+    }
+    command(root, "cargo", &args)?;
+    let reduced = parse(&lock_path)?;
+    for package in reduced
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .context("reduced lockfile has no packages")?
+    {
+        if !original_packages.iter().any(|original| {
+            ["name", "version", "source", "checksum"]
+                .iter()
+                .all(|key| original.get(key) == package.get(key))
+        }) {
+            bail!("release workspace reduction changed a locked package identity");
+        }
+    }
+    Ok(())
+}
+
 fn snapshot_project(root: &Path, destination: &Path) -> Result<()> {
     if destination.exists() {
         bail!("snapshot destination exists; use a fresh temporary directory");
@@ -205,6 +260,7 @@ fn snapshot_project(root: &Path, destination: &Path) -> Result<()> {
     {
         bail!("snapshot lacks Rust entry points; restore src/main.rs and xtask/src/main.rs");
     }
+    reduce_release_workspace(destination)?;
     Ok(())
 }
 fn validate_vendor(root: &Path) -> Result<Vec<Value>> {
@@ -821,6 +877,81 @@ mod tests {
             .collect()
     }
     #[test]
+    fn repository_release_snapshot_keeps_a_cargo_resolvable_lockfile() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let temporary = TempDir::new("repository-snapshot-test").unwrap();
+        let snapshot = temporary.path().join("source");
+        snapshot_project(root, &snapshot).unwrap();
+        let output = Command::new("cargo")
+            .args([
+                "metadata",
+                "--locked",
+                "--offline",
+                "--no-deps",
+                "--format-version",
+                "1",
+            ])
+            .current_dir(&snapshot)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        command(
+            &snapshot,
+            "cargo",
+            &["update", "--workspace", "--locked", "--offline"],
+        )
+        .unwrap();
+        let lock = parse(&snapshot.join("Cargo.lock")).unwrap();
+        assert!(lock["package"].as_array().unwrap().iter().all(|package| {
+            package
+                .get("source")
+                .and_then(toml::Value::as_str)
+                .is_none_or(|source| !source.starts_with("git+"))
+        }));
+    }
+
+    #[test]
+    fn release_snapshot_resolves_its_reduced_workspace_with_the_locked_versions() {
+        let f = fixture();
+        fs::remove_dir_all(f.root.join("vendor")).unwrap();
+        fs::remove_file(f.root.join(".cargo/config.toml")).unwrap();
+        let manifest = "[package]\nname='uareu'\nversion='0.1.0'\nedition='2024'\n[workspace]\nmembers=['apps/fingerprint-studio','xtask']\ndefault-members=['.']\nresolver='3'\n";
+        write(&f.root, "Cargo.toml", manifest);
+        write(&f.root, "src/main.rs", "fn main() {}\n");
+        write(&f.root, "xtask/src/main.rs", "fn main() {}\n");
+        write(
+            &f.root,
+            "Cargo.lock",
+            "version=4\n[[package]]\nname='uareu'\nversion='0.1.0'\n[[package]]\nname='xtask'\nversion='0.1.0'\n[[package]]\nname='fingerprint-studio'\nversion='0.1.0'\n",
+        );
+        let original_lock = fs::read(f.root.join("Cargo.lock")).unwrap();
+        let snapshot = f.temp.path().join("snapshot");
+        snapshot_project(&f.root, &snapshot).unwrap();
+        let output = Command::new("cargo")
+            .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+            .current_dir(&snapshot)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let metadata: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(metadata["workspace_members"].as_array().unwrap().len(), 2);
+        assert!(!snapshot.join("apps").exists());
+        assert_eq!(
+            fs::read_to_string(f.root.join("Cargo.toml")).unwrap(),
+            manifest
+        );
+        assert_eq!(fs::read(f.root.join("Cargo.lock")).unwrap(), original_lock);
+    }
+
+    #[test]
     fn archive_preserves_source_notice_bytes_and_build_receipt() {
         let f = fixture();
         let (archive, checksum) = f.build("dist", None).unwrap();
@@ -943,9 +1074,13 @@ directory = 'legacy-vendor'
             write(&f.root, name, "must not ship");
         }
         let sdk_sources = [
+            "examples/evaluate_recognition.rs",
+            "examples/evaluation/dataset.rs",
+            "examples/evaluation/metrics.rs",
             "include/uareu.h",
             "examples/csharp/Native.cs",
             "examples/csharp/UareuExample.csproj",
+            "tests/support/FingerprintIoProbe.java",
             "tests/c/abi_smoke.c",
             "scripts/test-windows-dll.ps1",
             "scripts/test-macos-dylib.py",
@@ -964,7 +1099,8 @@ directory = 'legacy-vendor'
         snapshot_project(&f.root, &snapshot).unwrap();
         for name in sdk_sources {
             assert_eq!(
-                fs::read_to_string(snapshot.join(name)).unwrap(),
+                fs::read_to_string(snapshot.join(name))
+                    .unwrap_or_else(|error| panic!("{name}: {error}")),
                 "SDK source"
             );
         }
