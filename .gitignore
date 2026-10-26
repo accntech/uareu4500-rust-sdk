@@ -3,8 +3,10 @@
 *.png
 *.pgm
 .DS_Store
+__pycache__/
 
 /dist/
+/docs/
 /examples/csharp/bin/
 /examples/csharp/obj/
 /examples/engine/bin/
