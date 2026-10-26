@@ -9,4 +9,4 @@ description = "GPUI fingerprint capture and in-memory enrollment example"
 anyhow = "1.0.104"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "cc9af8d036270ad39953e6bc26e5167f84989af3", version = "0.2.1", features = ["runtime_shaders"] }
 image = { version = "0.25", default-features = false }
-uareu = { version = "0.1.0", path = "../.." }
+uareu = { version = "0.1.0", path = "../..", default-features = false }

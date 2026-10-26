@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Compare the native image boundary with the Rust/CLI path on identical inputs.
-use std::{fs, path::PathBuf, process::Command, ptr::null_mut};
+#[cfg(feature = "cli")]
+use std::process::Command;
+use std::{fs, path::PathBuf, ptr::null_mut};
 use uareu::{ffi::*, frame::decode_frame_with_metadata, quality};
 
 struct Directory(PathBuf);
@@ -110,20 +112,23 @@ fn native_boundary_and_cli_preserve_contrast_pixels_and_metadata() {
                 assert_eq!(uareu_image_free(handle), OK);
                 // Same PNG encoder, pixels and provenance, not merely similar contrast.
                 assert_eq!(fs::read(&original).unwrap(), fs::read(&saved).unwrap());
-                let cli = Command::new(env!("CARGO_BIN_EXE_uareu"))
-                    .args(["quality", "--input"])
-                    .arg(&saved)
-                    .output()
-                    .unwrap();
-                assert!(
-                    cli.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&cli.stderr)
-                );
-                assert_eq!(
-                    serde_json::from_slice::<serde_json::Value>(&cli.stdout).unwrap(),
-                    native_report
-                );
+                #[cfg(feature = "cli")]
+                {
+                    let cli = Command::new(env!("CARGO_BIN_EXE_uareu"))
+                        .args(["quality", "--input"])
+                        .arg(&saved)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        cli.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&cli.stderr)
+                    );
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&cli.stdout).unwrap(),
+                        native_report
+                    );
+                }
             }
         }
     }

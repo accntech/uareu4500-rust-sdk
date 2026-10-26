@@ -314,6 +314,7 @@ fn png_rejects_metadata_conflicts_and_non_grayscale_input() {
 }
 
 #[test]
+#[cfg(feature = "cli")]
 fn quality_cli_reports_unknown_and_declared_resolution_without_touching_input() {
     let dir = Directory::new();
     let path = dir.0.join("input.png");

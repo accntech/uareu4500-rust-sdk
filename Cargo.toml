@@ -8,8 +8,8 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-ctrlc = "3"
+clap = { version = "4", features = ["derive"], optional = true }
+ctrlc = { version = "3", optional = true }
 futures-core = { version = "0.3", default-features = false }
 getrandom = { version = "0.3", features = ["std"] }
 nusb = "0.2.9"
@@ -25,8 +25,13 @@ crate-type = ["rlib", "cdylib"]
 [[bin]]
 name = "uareu"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [workspace]
 members = ["apps/fingerprint-studio", "xtask"]
 default-members = ["."]
 resolver = "3"
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:ctrlc"]
