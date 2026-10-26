@@ -7,7 +7,7 @@ project's own ABI, not the proprietary U.are.U binary interface.
 ## Build and run
 
 The Windows example needs .NET 10, x64 Windows/MSVC, and
-[WinUSB setup](../../README.md#windows-usb-setup). Recognition uses an optional
+[WinUSB setup](../../SDK_GUIDE.md#windows-usb-setup). Recognition uses an optional
 local SourceAFIS 3.14.0 helper; capture needs no helper.
 
 ```powershell

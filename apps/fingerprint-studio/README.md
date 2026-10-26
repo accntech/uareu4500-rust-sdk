@@ -21,7 +21,7 @@ On macOS, build and run a named app bundle:
 
 Connect a U.are.U 4000B/4500 (`05ba:000a`) and choose **Refresh**. The app uses the
 first discovered reader; disconnect others to select a particular device. Capture
-needs no recognition helper. Follow the [OS USB setup](../../README.md#windows-usb-setup)
+needs no recognition helper. Follow the [OS USB setup](../../SDK_GUIDE.md#windows-usb-setup)
 for drivers and permissions.
 
 ## Configure matching
