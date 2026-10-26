@@ -5,7 +5,7 @@
 use crate::{
     frame::Image,
     metadata::{CaptureMetadata, CapturedImage, ProcessingStep},
-    recognition::{Workspace, private_file, read_bounded},
+    process::{Child, Workspace, private_file, read_bounded},
 };
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -71,21 +71,9 @@ impl Jpeg2000Codec {
             .stdin(Stdio::null())
             .stdout(private_file(&workspace.join("stdout.txt"))?)
             .stderr(private_file(&stderr)?);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
-        }
-        struct Child(std::process::Child);
-        impl Drop for Child {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let mut child = Child(command.spawn()?);
+        let child = Child::spawn(&mut command)?;
         let start = Instant::now();
-        loop {
+        let status = child.wait_checked(|| {
             ensure!(start.elapsed() < self.timeout, "OpenJPEG codec timed out");
             let mut total = 0u64;
             let mut count = 0;
@@ -98,16 +86,14 @@ impl Jpeg2000Codec {
                     "OpenJPEG output limit exceeded"
                 );
             }
-            if let Some(status) = child.0.try_wait()? {
-                ensure!(
-                    status.success(),
-                    "OpenJPEG codec failed: {}",
-                    String::from_utf8_lossy(&read_bounded(&stderr, 65536)?)
-                );
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+            Ok(())
+        })?;
+        ensure!(
+            status.success(),
+            "OpenJPEG codec failed: {}",
+            String::from_utf8_lossy(&read_bounded(&stderr, 65536)?)
+        );
+        Ok(())
     }
     /// Encode a lossless raw J2K codestream. No resolution is inferred or embedded.
     pub fn encode(&self, captured: &CapturedImage) -> Result<Vec<u8>> {

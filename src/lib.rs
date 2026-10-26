@@ -7,6 +7,7 @@ pub mod frame;
 pub mod image_record;
 pub mod jpeg2000;
 pub mod metadata;
+mod process;
 pub mod processing;
 pub mod protocol;
 pub mod quality;

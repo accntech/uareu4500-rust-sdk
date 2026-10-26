@@ -3,19 +3,11 @@ use super::{EngineIdentity, QualityOutcome, analysis_region};
 use crate::{
     frame::Image,
     metadata::{CapturedImage, Resolution},
+    process::{Workspace, canonical_cli_path, hash_file, run_captured as run},
 };
-use anyhow::{Context, Result, bail, ensure};
-use sha2::{Digest, Sha256};
-use std::{
-    collections::BTreeMap,
-    fs::{self, File, OpenOptions},
-    io::Read,
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::{Duration, Instant},
-};
+use anyhow::{Context, Result, ensure};
+use std::{collections::BTreeMap, fs, path::PathBuf, time::Duration};
 
-const OUTPUT_LIMIT: u64 = 128 * 1024;
 const SUPPORTED_VERSION: &str = "2.3.0";
 
 /// Optional, externally installed NIST CLI. No executable is downloaded or bundled.
@@ -210,151 +202,6 @@ impl Nfiq2 {
     }
 }
 
-/// The upstream Windows model parser joins paths with '/'. That is incompatible
-/// with Rust's verbatim '\\?\' canonical paths, which disable slash normalization.
-pub(super) fn canonical_cli_path(path: &Path) -> std::io::Result<PathBuf> {
-    let canonical = path.canonicalize()?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::{OsStrExt, OsStringExt};
-        let wide: Vec<_> = canonical.as_os_str().encode_wide().collect();
-        let unc: Vec<_> = "\\\\?\\UNC\\".encode_utf16().collect();
-        let verbatim: Vec<_> = "\\\\?\\".encode_utf16().collect();
-        if wide.starts_with(&unc) {
-            let mut normal: Vec<_> = "\\\\".encode_utf16().collect();
-            normal.extend_from_slice(&wide[unc.len()..]);
-            return Ok(std::ffi::OsString::from_wide(&normal).into());
-        }
-        if wide.starts_with(&verbatim) && wide.get(5) == Some(&(b':' as u16)) {
-            return Ok(std::ffi::OsString::from_wide(&wide[verbatim.len()..]).into());
-        }
-    }
-    Ok(canonical)
-}
-
-pub(super) fn hash_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path).context("cannot open engine/model for fingerprinting")?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0; 8192];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-pub(super) struct Workspace(pub(super) PathBuf);
-impl Workspace {
-    pub(super) fn new() -> Result<Self> {
-        for _ in 0..10 {
-            let mut nonce = [0; 16];
-            getrandom::fill(&mut nonce)?;
-            let path = std::env::temp_dir()
-                .join(format!("uareu-quality-{:032x}", u128::from_le_bytes(nonce)));
-            #[allow(unused_mut)]
-            let mut builder = fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            match builder.create(&path) {
-                Ok(()) => return Ok(Self(path)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        bail!("cannot allocate a private quality workspace")
-    }
-}
-impl Drop for Workspace {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-pub(super) fn private_file(path: &Path) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    Ok(options.open(path)?)
-}
-
-pub(super) fn run(
-    executable: &Path,
-    args: &[&std::ffi::OsStr],
-    directory: &Path,
-    stage: &str,
-    timeout: Duration,
-) -> Result<Vec<u8>> {
-    let stdout = directory.join(format!("{stage}.stdout"));
-    let stderr = directory.join(format!("{stage}.stderr"));
-    let mut command = Command::new(executable);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(private_file(&stdout)?)
-        .stderr(private_file(&stderr)?);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-    let mut child = command.spawn().context("cannot start quality engine")?;
-    let started = Instant::now();
-    loop {
-        let oversized = [stdout.as_path(), stderr.as_path()]
-            .iter()
-            .any(|path| fs::metadata(path).map_or(true, |m| m.len() > OUTPUT_LIMIT));
-        if oversized || started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(if oversized {
-                "quality engine output exceeded 128 KiB"
-            } else {
-                "quality engine evaluation timed out"
-            });
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    let mut error_output = Vec::new();
-                    File::open(&stderr)?
-                        .take(OUTPUT_LIMIT)
-                        .read_to_end(&mut error_output)?;
-                    bail!(
-                        "quality engine process failed ({status}): {}",
-                        String::from_utf8_lossy(&error_output).trim()
-                    );
-                }
-                let mut output = Vec::new();
-                File::open(&stdout)?
-                    .take(OUTPUT_LIMIT + 1)
-                    .read_to_end(&mut output)?;
-                ensure!(
-                    output.len() as u64 <= OUTPUT_LIMIT
-                        && fs::metadata(&stderr)?.len() <= OUTPUT_LIMIT,
-                    "quality engine output exceeded 128 KiB"
-                );
-                return Ok(output);
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.into());
-            }
-        }
-    }
-}
-
 fn parse_output(bytes: &[u8]) -> Result<(u8, BTreeMap<String, f64>)> {
     let text = std::str::from_utf8(bytes).context("NFIQ 2 output is not UTF-8")?;
     let records = csv_records(text)?;
@@ -463,6 +310,7 @@ fn csv_records(text: &str) -> Result<Vec<Vec<String>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{path::Path, process::Command, time::Instant};
     const HEADER: &str = "Filename,QualityScore,OptionalError,Quantized,Resampled,UniformImage,EmptyImageOrContrastTooLow,FingerprintImageWithMinutiae,SufficientFingerprintForeground\n";
 
     #[test]

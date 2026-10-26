@@ -2,15 +2,16 @@
 //! Optional local SourceAFIS helper. Scores are not DigitalPersona scores.
 use crate::{
     metadata::{CapturedImage, Region, Resolution},
+    process::{Child, Workspace, private_file, read_bounded},
     quality::analysis_region,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::Command,
     time::{Duration, Instant},
 };
@@ -136,53 +137,39 @@ impl RecognitionEngine {
             .stdin(File::open(input_path)?)
             .stdout(private_file(&stdout)?)
             .stderr(private_file(&stderr)?);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
-        }
-        struct Child(std::process::Child);
-        impl Drop for Child {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let mut child = Child(command.spawn().context("cannot start recognition helper")?);
-        loop {
+        let child = Child::spawn(&mut command).context("cannot start recognition helper")?;
+        let status = child.wait_checked(|| {
             ensure!(
                 fs::metadata(&stdout)?.len() <= 16 * 1024 * 1024
                     && fs::metadata(&stderr)?.len() <= 65536,
                 "recognition output limit exceeded"
             );
             ensure!(start.elapsed() < self.timeout, "recognition timed out");
-            if let Some(status) = child.0.try_wait()? {
-                if !status.success() {
-                    let message = read_bounded(&stderr, 65536)?;
-                    bail!(
-                        "recognition failed: {}",
-                        String::from_utf8_lossy(&message).trim()
-                    );
-                }
-                let mut bytes = Vec::new();
-                File::open(stdout)?
-                    .take(16 * 1024 * 1024 + 1)
-                    .read_to_end(&mut bytes)?;
-                ensure!(
-                    bytes.len() <= 16 * 1024 * 1024,
-                    "recognition output limit exceeded"
-                );
-                let response: serde_json::Value = serde_json::from_slice(&bytes)?;
-                ensure!(
-                    response["schema_version"] == 1
-                        && response["engine"] == "SourceAFIS"
-                        && response["version"] == "3.14.0",
-                    "unsupported recognition protocol/engine version"
-                );
-                return Ok(response);
-            }
-            std::thread::sleep(Duration::from_millis(10));
+            Ok(())
+        })?;
+        if !status.success() {
+            let message = read_bounded(&stderr, 65536)?;
+            bail!(
+                "recognition failed: {}",
+                String::from_utf8_lossy(&message).trim()
+            );
         }
+        let mut bytes = Vec::new();
+        File::open(stdout)?
+            .take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() <= 16 * 1024 * 1024,
+            "recognition output limit exceeded"
+        );
+        let response: serde_json::Value = serde_json::from_slice(&bytes)?;
+        ensure!(
+            response["schema_version"] == 1
+                && response["engine"] == "SourceAFIS"
+                && response["version"] == "3.14.0",
+            "unsupported recognition protocol/engine version"
+        );
+        Ok(response)
     }
     pub fn extract(&self, captured: &CapturedImage) -> Result<FingerprintTemplate> {
         captured.metadata.validate(&captured.image)?;
@@ -544,62 +531,6 @@ impl RecognitionEngine {
             source_processing: Vec::new(),
         })
     }
-}
-
-pub(crate) fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    File::open(path)?
-        .take(maximum as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= maximum, "engine output limit exceeded");
-    Ok(bytes)
-}
-pub(crate) struct Workspace(pub(crate) PathBuf);
-impl Workspace {
-    pub(crate) fn new() -> Result<Self> {
-        let root = fs::canonicalize(std::env::temp_dir())?;
-        for _ in 0..10 {
-            let mut nonce = [0; 16];
-            getrandom::fill(&mut nonce)?;
-            let path = root.join(format!("uareu-engine-{:032x}", u128::from_le_bytes(nonce)));
-            #[allow(unused_mut)]
-            let mut builder = fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            match builder.create(&path) {
-                Ok(()) => return Ok(Self(path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        bail!("cannot allocate recognition workspace")
-    }
-}
-impl Drop for Workspace {
-    fn drop(&mut self) {
-        if self.0.is_absolute()
-            && self
-                .0
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("uareu-engine-"))
-            && fs::canonicalize(std::env::temp_dir()).ok().as_deref() == self.0.parent()
-        {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-}
-pub(crate) fn private_file(path: &Path) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    Ok(options.open(path)?)
 }
 
 #[cfg(test)]

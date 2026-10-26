@@ -3,7 +3,7 @@
 use crate::{
     frame::Image,
     metadata::{CapturedImage, ProcessingStep, Resolution, ResolutionProvenance},
-    recognition::{Workspace, private_file, read_bounded},
+    process::{Child, Workspace, private_file, read_bounded},
 };
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -176,21 +176,9 @@ impl WsqCodec {
             .stdin(Stdio::null())
             .stdout(private_file(&stdout)?)
             .stderr(private_file(&stderr)?);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
-        }
-        struct Child(std::process::Child);
-        impl Drop for Child {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let mut child = Child(command.spawn()?);
+        let child = Child::spawn(&mut command)?;
         let start = Instant::now();
-        loop {
+        let status = child.wait_checked(|| {
             ensure!(start.elapsed() < self.timeout, "NBIS codec timed out");
             for path in fs::read_dir(workspace)? {
                 ensure!(
@@ -198,16 +186,14 @@ impl WsqCodec {
                     "codec output limit exceeded"
                 );
             }
-            if let Some(status) = child.0.try_wait()? {
-                ensure!(
-                    status.success(),
-                    "NBIS codec failed: {}",
-                    String::from_utf8_lossy(&read_bounded(&stderr, 65536)?)
-                );
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+            Ok(())
+        })?;
+        ensure!(
+            status.success(),
+            "NBIS codec failed: {}",
+            String::from_utf8_lossy(&read_bounded(&stderr, 65536)?)
+        );
+        Ok(())
     }
     pub fn encode(&self, captured: &CapturedImage, bitrate: f64) -> Result<Vec<u8>> {
         captured.metadata.validate(&captured.image)?;

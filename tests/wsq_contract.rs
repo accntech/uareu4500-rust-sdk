@@ -16,10 +16,10 @@ fn decoded_nistcom_variants_and_external_failures_are_checked() {
             .unwrap()
             .success()
     );
-    let make = || WsqCodec {
+    let make = |timeout| WsqCodec {
         encoder: PathBuf::from("absent"),
         decoder: executable.clone(),
-        timeout: Duration::from_millis(300),
+        timeout,
     };
     for (mode, ok) in [
         ("normal", true),
@@ -31,7 +31,14 @@ fn decoded_nistcom_variants_and_external_failures_are_checked() {
         ("hang", false),
     ] {
         fs::write(w.0.join("mode"), mode).unwrap();
-        let result = make().decode(&[0xff, 0xa0, 0xff, 0xa1]);
+        // Leave room for process startup under build load; only the hang case
+        // needs a deliberately short deadline.
+        let timeout = if mode == "hang" {
+            Duration::from_millis(300)
+        } else {
+            Duration::from_secs(5)
+        };
+        let result = make(timeout).decode(&[0xff, 0xa0, 0xff, 0xa1]);
         assert_eq!(result.is_ok(), ok, "mode={mode}: {result:?}");
         if let Ok(image) = result {
             assert_eq!((image.image.width, image.image.height), (2, 3));

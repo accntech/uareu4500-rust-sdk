@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Optional NBIS 5.0.0 legacy NFIQ 1 CLI integration. Never NFIQ 2 scores.
-use super::{
-    EngineIdentity, analysis_region,
-    nfiq2::{Workspace, canonical_cli_path, hash_file, private_file, run},
-};
+use super::{EngineIdentity, analysis_region};
 use crate::metadata::{CapturedImage, Region, Resolution};
+use crate::process::{Workspace, canonical_cli_path, hash_file, private_file, run_captured as run};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::{
